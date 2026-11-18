@@ -44,6 +44,12 @@ var blockedPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("198.18.0.0/15"),
 	netip.MustParsePrefix("240.0.0.0/4"),
 	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"), // local-use translation, RFC 8215
+	netip.MustParsePrefix("2002::/16"),      // 6to4 can wrap a private IPv4
+	netip.MustParsePrefix("2001::/32"),      // Teredo
+	netip.MustParsePrefix("2001:db8::/32"),  // documentation
+	netip.MustParsePrefix("3fff::/20"),      // documentation, RFC 9637
+	netip.MustParsePrefix("100::/64"),       // discard-only
 }
 
 func publicAddr(a netip.Addr) bool {

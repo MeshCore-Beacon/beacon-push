@@ -81,15 +81,15 @@ Authenticate with `Authorization: Bearer <push id>.<push secret>`.
   It is scoped to the sending server, and the relay remembers each id's
   outcome for at least 24 hours (30 days in practice). Repeating an id that
   was sent answers `ok` with the earlier `messageId` and sends and counts
-  nothing. Repeating an id whose send is still under way, or whose outcome
+  nothing, even if the handle has gone or the relay is paused since. Repeating an id whose send is still under way, or whose outcome
   is unknown because the relay stopped mid-send, answers `rate_limited` with
   `retryAfterSeconds: 30`; after 2 minutes such a send counts as failed and
   the next repeat sends again. Repeating an id whose send failed sends again.
   beacon-server uses `<outbox row id>:<device session uuid>`.
 
 The relay sends up to 8 messages of a batch at once and starts no new one
-after 10 seconds; each FCM call is limited to 10 seconds, so the answer comes
-within about 20 seconds. Items not started in time answer `rate_limited` with
+after 10 seconds; each message's whole FCM send, access token included, is
+limited to 10 seconds, so the answer comes within about 20 seconds. Items not started in time answer `rate_limited` with
 `retryAfterSeconds: 5`.
 
 The answer has one result per message, in order:
@@ -105,18 +105,21 @@ servers that do not read the field.
 | `rate_limited` | Not sent: over a limit, the relay paused after FCM 500/503, not started before the batch deadline, or an `id` still in flight | Hold until `retryAfterSeconds` (else `Retry-After`); not an attempt |
 | `invalid_handle` | Unknown, revoked, another server's, or FCM said UNREGISTERED for the handle's current token | Delete the device |
 | `too_large`, `invalid` | Refused: a bad item, or FCM refused the message (400 INVALID_ARGUMENT) | Done for this notice, never resend |
-| `failed` | Transient: FCM unreachable or another FCM error, or the token changed while sending | Retry later; counts an attempt |
+| `failed` | Transient: FCM unreachable or another FCM error, the token changed while sending, or the relay could not record a send FCM accepted | Retry later; counts an attempt |
 
 When FCM answers 500 or 503, the relay stops sending for everyone for FCM's
-`Retry-After` (a minute if it gives none, at most an hour); that item is
+`Retry-After`, at most an hour. Without one it pauses a minute, doubling
+with each new outage up to an hour until a send succeeds again. That item is
 `failed` and every item after it is `rate_limited` until the pause ends. An
-FCM 429 makes only that item `rate_limited`, for FCM's `Retry-After` or a
-minute. A message counts against the daily quotas while it is being sent
+FCM 429 makes that item `rate_limited`, for FCM's `Retry-After` (a minute if
+it gives none, at most an hour), and later items for the same device wait out
+the same time without reaching FCM. A message counts against the daily quotas while it is being sent
 and stays counted only if FCM accepts it.
 
 A suspended server gets `403 suspended` for the whole batch, and a banned one
 `403 banned`. A batch waiting behind another from the same server checks the
-server's status and quotas again before it starts.
+server's status and quotas again before it starts, and each message checks
+them again before it goes out.
 
 **`POST /v1/verify-domain`** runs the domain check now:
 `{"domainVerified": true}` or `{"domainVerified": false, "reason": "..."}`.

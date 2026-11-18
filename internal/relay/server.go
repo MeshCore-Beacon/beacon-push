@@ -1,0 +1,345 @@
+// Copyright 2026 Beacon Contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// Package relay is the push relay: the registration pages operators use, the API beacon-server calls to send
+// notifications, and the API the Beacon app calls to get a device handle.
+package relay
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"log/slog"
+	"net"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+
+	"github.com/MeshCore-Beacon/beacon-push/internal/config"
+	"github.com/MeshCore-Beacon/beacon-push/internal/fcm"
+	"github.com/MeshCore-Beacon/beacon-push/internal/limit"
+	"github.com/MeshCore-Beacon/beacon-push/internal/mail"
+	"github.com/MeshCore-Beacon/beacon-push/internal/store"
+)
+
+// Limits. Starting numbers; tune with real traffic.
+const (
+	EmailTierPerMinute    = 30
+	EmailTierPerDay       = 500
+	VerifiedTierPerMinute = 300
+	VerifiedTierPerDay    = 10_000
+	HandlePerMinute       = 10
+	HandlePerDay          = 200
+	GlobalPerDay          = 100_000
+
+	MaxServersPerEmail    = 2
+	RegisterPerHourPerIP  = 3
+	LinkMailsPerHour      = 5 // per email address
+	VerifyPerHourPerIP    = 20
+	HandleCreatesPerHour  = 20 // per IP
+	HandleUpdatesPerHour  = 60 // per IP
+	DomainChecksPerHour   = 10 // per server, on request
+	HandleReviewThreshold = 1000
+
+	MaxBody           = 256 << 10
+	MaxBatch          = 100
+	MaxCiphertext     = 2048
+	MaxCollapseKey    = 40
+	MaxTTL            = 28 * 24 * time.Hour
+	DefaultTTL        = 24 * time.Hour
+	LinkLifetime      = 24 * time.Hour
+	DomainRecheck     = 24 * time.Hour
+	TermsVersion      = 1
+	harvestMinSends   = 100
+	harvestBadPercent = 20
+)
+
+// Options builds a Server. Now, ChallengeClient and Logger are optional.
+type Options struct {
+	Config          config.Config
+	Store           *store.Store
+	Push            fcm.Sender
+	Mail            mail.Sender
+	Now             func() time.Time
+	ChallengeClient *http.Client
+	Logger          *slog.Logger
+}
+
+// Server is the relay.
+type Server struct {
+	cfg       config.Config
+	store     *store.Store
+	push      fcm.Sender
+	mail      mail.Sender
+	now       func() time.Time
+	challenge *http.Client
+	log       *slog.Logger
+
+	minute, hour *limit.Window
+	harvest      harvestCounter
+	checking     sync.Map // server ID -> struct{}, a domain check in flight
+	reviewed     sync.Map // server ID -> struct{}, the device-count review notice was sent
+}
+
+// New builds the relay.
+func New(o Options) *Server {
+	s := &Server{cfg: o.Config, store: o.Store, push: o.Push, mail: o.Mail, now: o.Now, challenge: o.ChallengeClient, log: o.Logger,
+		minute: limit.New(time.Minute), hour: limit.New(time.Hour), harvest: harvestCounter{m: map[string]*harvestSlot{}}}
+	if s.now == nil {
+		s.now = time.Now
+	}
+	if s.challenge == nil {
+		s.challenge = challengeClient(o.Config.DevMode)
+	}
+	if s.log == nil {
+		s.log = slog.Default()
+	}
+	return s
+}
+
+// Handler is the relay's HTTP surface.
+func (s *Server) Handler() http.Handler {
+	r := chi.NewRouter()
+	r.Use(securityHeaders)
+	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
+
+	r.Get("/", s.page("index"))
+	r.Get("/terms", s.page("terms"))
+	r.Get("/privacy", s.page("privacy"))
+	r.Get("/register", s.registerForm)
+	r.Post("/register", s.register)
+	r.Get("/verify", s.page("verify"))
+	r.Post("/verify", s.verify)
+	r.Handle("/static/*", staticFiles())
+
+	r.Route("/v1", func(r chi.Router) {
+		r.Post("/hello", s.withInstance(s.hello))
+		r.Post("/verify-domain", s.withInstance(s.verifyDomain))
+		r.Post("/send", s.withInstance(s.send))
+		r.Post("/handles", s.createHandle)
+		r.Put("/handles/{handle}", s.refreshHandle)
+		r.Delete("/handles/{handle}", s.deleteHandle)
+	})
+	return r
+}
+
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Content-Security-Policy", "default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// clientIP is the caller's address: behind Caddy the last X-Forwarded-For entry, which Caddy appended itself.
+func (s *Server) clientIP(r *http.Request) string {
+	if s.cfg.TrustProxy {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			parts := strings.Split(xff, ",")
+			if ip := net.ParseIP(strings.TrimSpace(parts[len(parts)-1])); ip != nil {
+				return ip.String()
+			}
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// ── Identifiers and secrets ─────────────────────────────────────────────────────────────────────
+
+func randomString(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func newInstanceID() string {
+	const alphabet = "abcdefghijkmnpqrstuvwxyz23456789" // no l, o, 0, 1
+	b := make([]byte, 10)
+	_, _ = rand.Read(b)
+	for i := range b {
+		b[i] = alphabet[int(b[i])%len(alphabet)]
+	}
+	return "inst_" + string(b)
+}
+
+func hash(s string) []byte {
+	sum := sha256.Sum256([]byte(s))
+	return sum[:]
+}
+
+// EmailHash is how a banned email is remembered: never the address itself.
+func EmailHash(email string) []byte { return hash("email:" + strings.ToLower(email)) }
+
+// ── JSON helpers ────────────────────────────────────────────────────────────────────────────────
+
+type apiError struct {
+	Error struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeError(w http.ResponseWriter, status int, code, msg string) {
+	var e apiError
+	e.Error.Code, e.Error.Message = code, msg
+	writeJSON(w, status, e)
+}
+
+func rateLimited(w http.ResponseWriter, wait time.Duration) {
+	w.Header().Set("Retry-After", retryAfter(wait))
+	writeError(w, http.StatusTooManyRequests, "rate_limited", "Too many requests. Try again later.")
+}
+
+func retryAfter(d time.Duration) string {
+	secs := int((d + time.Second - 1) / time.Second)
+	if secs < 1 {
+		secs = 1
+	}
+	return strconv.Itoa(secs)
+}
+
+// decode reads a JSON body of at most MaxBody bytes.
+func decode(w http.ResponseWriter, r *http.Request, v any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, MaxBody)
+	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			writeError(w, http.StatusRequestEntityTooLarge, "too_large", "The request body is too large.")
+		} else {
+			writeError(w, http.StatusBadRequest, "bad_request", "The request body is not valid JSON.")
+		}
+		return false
+	}
+	return true
+}
+
+// ── Instance authentication ─────────────────────────────────────────────────────────────────────
+
+type instanceHandler func(w http.ResponseWriter, r *http.Request, inst store.Instance)
+
+// withInstance authenticates "Authorization: Bearer <push id>.<push secret>". Banned servers are refused outright;
+// suspended ones reach the handler, which decides.
+func (s *Server) withInstance(next instanceHandler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		id, secret, found := strings.Cut(token, ".")
+		if !ok || !found || id == "" || secret == "" {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "Send Authorization: Bearer <push id>.<push secret>.")
+			return
+		}
+		inst, err := s.store.Instance(r.Context(), id)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			s.log.Error("instance lookup failed", "component", "relay", "err", err)
+			writeError(w, http.StatusInternalServerError, "internal", "Something went wrong.")
+			return
+		}
+		// Compare even for an unknown ID so the answer takes the same time.
+		stored := inst.SecretHash
+		if stored == nil {
+			stored = make([]byte, sha256.Size)
+		}
+		if subtle.ConstantTimeCompare(hash(secret), stored) != 1 || errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "Unknown push ID or wrong push secret.")
+			return
+		}
+		if inst.Status == store.StatusBanned {
+			writeError(w, http.StatusForbidden, "banned", "This server is banned from the push relay.")
+			return
+		}
+		next(w, r, inst)
+	}
+}
+
+// Tier is a server's limits and the name of where they come from.
+type Tier struct {
+	Name              string `json:"tier"`
+	PerMinute, PerDay int
+}
+
+// TierFor is the limits that apply to a server: an admin override, a verified domain, or the email tier.
+func TierFor(inst store.Instance) Tier {
+	t := Tier{Name: "email", PerMinute: EmailTierPerMinute, PerDay: EmailTierPerDay}
+	if inst.DomainVerifiedAt != 0 {
+		t = Tier{Name: "verified", PerMinute: VerifiedTierPerMinute, PerDay: VerifiedTierPerDay}
+	}
+	if inst.QuotaPerMinute > 0 || inst.QuotaPerDay > 0 {
+		t.Name = "custom"
+		if inst.QuotaPerMinute > 0 {
+			t.PerMinute = inst.QuotaPerMinute
+		}
+		if inst.QuotaPerDay > 0 {
+			t.PerDay = inst.QuotaPerDay
+		}
+	}
+	return t
+}
+
+// notifyAdmin mails the admin address, when one is set. Failures are logged, never returned.
+func (s *Server) notifyAdmin(ctx context.Context, subject, text string) {
+	if s.cfg.AdminEmail == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	if err := s.mail.Send(ctx, mail.Message{To: s.cfg.AdminEmail, Subject: subject, Text: text}); err != nil {
+		s.log.Warn("admin notice not sent", "component", "relay", "subject", subject, "err", err)
+	}
+}
+
+// ── Harvesting detection ────────────────────────────────────────────────────────────────────────
+
+// harvestCounter counts, per server and hour, the handles it addressed and how many were not its own or did not
+// exist: a server trying handles it harvested elsewhere.
+type harvestCounter struct {
+	mu sync.Mutex
+	m  map[string]*harvestSlot
+}
+
+type harvestSlot struct {
+	start     time.Time
+	sends     int
+	bad       int
+	suspended bool
+}
+
+// add counts one addressed handle and reports whether the server just crossed the line.
+func (h *harvestCounter) add(id string, bad bool, now time.Time) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	s := h.m[id]
+	if s == nil || now.Sub(s.start) >= time.Hour {
+		s = &harvestSlot{start: now}
+		h.m[id] = s
+	}
+	s.sends++
+	if bad {
+		s.bad++
+	}
+	if !s.suspended && s.sends >= harvestMinSends && s.bad*100 > s.sends*harvestBadPercent {
+		s.suspended = true
+		return true
+	}
+	return false
+}

@@ -1,0 +1,23 @@
+{{template "head" "Your Push ID"}}
+<h1>{{.Result.Name}} is registered</h1>
+<p class="warning"><strong>Save the Push secret now.</strong> It is shown only on this page. If you lose it, register
+the server again.</p>
+
+<h2>config.yaml</h2>
+<pre>alerts:
+  push:
+    enabled: true
+    id: {{.Result.PushID}}</pre>
+
+<h2>.env</h2>
+<pre>BEACON_PUSH_SECRET={{.Result.Secret}}</pre>
+
+<p>Restart beacon-server. At startup it logs that push notifications go through this relay, and which limits
+apply.</p>
+{{if .Result.URL}}
+<p>Your server is then checked at <code>{{.Result.URL}}/.well-known/beacon-push</code>. When it passes, your
+limits go up.</p>
+{{end}}
+<p class="hint">Leave <code>alerts.push.server</code> unset: it defaults to {{.Result.Server}}, the official push
+server, and the Beacon app only receives notifications from it.</p>
+{{template "foot"}}

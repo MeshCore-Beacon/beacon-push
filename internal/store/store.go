@@ -1,0 +1,531 @@
+// Copyright 2026 Beacon Contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// Package store keeps the relay's state in one SQLite file: registered servers, registration links, device handles,
+// the send log and daily usage. Times are Unix milliseconds. Secrets are stored only as SHA-256 hashes.
+package store
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"time"
+
+	_ "modernc.org/sqlite"
+)
+
+// ErrNotFound is returned when a row does not exist.
+var ErrNotFound = errors.New("store: not found")
+
+// ErrLimit is returned when an email already has the most servers it may register.
+var ErrLimit = errors.New("store: server limit reached")
+
+// Instance statuses.
+const (
+	StatusActive    = "active"
+	StatusSuspended = "suspended"
+	StatusBanned    = "banned"
+)
+
+// Store is the relay database. One connection: SQLite serialises writes anyway, and this keeps transactions simple.
+type Store struct {
+	db *sql.DB
+}
+
+var migrations = []string{
+	`CREATE TABLE instances (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		email TEXT NOT NULL,
+		url TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'suspended', 'banned')),
+		secret_hash BLOB NOT NULL,
+		domain_verified_at INTEGER NOT NULL DEFAULT 0,
+		domain_checked_at INTEGER NOT NULL DEFAULT 0,
+		quota_per_minute INTEGER NOT NULL DEFAULT 0,
+		quota_per_day INTEGER NOT NULL DEFAULT 0,
+		terms_version INTEGER NOT NULL,
+		terms_accepted_at INTEGER NOT NULL,
+		created_at INTEGER NOT NULL,
+		created_ip TEXT NOT NULL DEFAULT ''
+	);
+	CREATE INDEX idx_instances_email ON instances (email);
+	CREATE TABLE email_tokens (
+		token_hash BLOB PRIMARY KEY,
+		purpose TEXT NOT NULL,
+		email TEXT NOT NULL,
+		payload TEXT NOT NULL DEFAULT '{}',
+		expires_at INTEGER NOT NULL,
+		used_at INTEGER
+	);
+	CREATE TABLE banned_emails (
+		email_hash BLOB PRIMARY KEY,
+		banned_at INTEGER NOT NULL
+	);
+	CREATE TABLE handles (
+		handle TEXT PRIMARY KEY,
+		secret_hash BLOB NOT NULL,
+		instance_id TEXT NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+		platform TEXT NOT NULL CHECK (platform IN ('ios', 'android')),
+		fcm_token TEXT NOT NULL,
+		created_at INTEGER NOT NULL,
+		refreshed_at INTEGER NOT NULL,
+		last_sent_at INTEGER NOT NULL DEFAULT 0,
+		revoked_at INTEGER NOT NULL DEFAULT 0,
+		UNIQUE (instance_id, fcm_token)
+	);
+	CREATE TABLE send_log (
+		message_id TEXT PRIMARY KEY,
+		instance_id TEXT NOT NULL,
+		handle TEXT NOT NULL,
+		at INTEGER NOT NULL,
+		size INTEGER NOT NULL,
+		ciphertext_sha256 BLOB NOT NULL,
+		status TEXT NOT NULL
+	);
+	CREATE INDEX idx_send_log_handle ON send_log (handle, at);
+	CREATE INDEX idx_send_log_at ON send_log (at);
+	CREATE TABLE usage_daily (
+		instance_id TEXT NOT NULL,
+		day TEXT NOT NULL,
+		sent INTEGER NOT NULL DEFAULT 0,
+		rate_limited INTEGER NOT NULL DEFAULT 0,
+		invalid_handle INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (instance_id, day)
+	);`,
+}
+
+// Open opens (creating if needed) the database at path and brings its schema up to date.
+func Open(ctx context.Context, path string) (*Store, error) {
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)")
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	s := &Store{db: db}
+	if err := s.migrate(ctx); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// DB is the underlying database, for tests and one-off repairs.
+func (s *Store) DB() *sql.DB { return s.db }
+
+// Backup writes a consistent copy of the database to path, which must not exist yet.
+func (s *Store) Backup(ctx context.Context, path string) error {
+	_, err := s.db.ExecContext(ctx, `VACUUM INTO ?`, path)
+	return err
+}
+
+// Close closes the database.
+func (s *Store) Close() error { return s.db.Close() }
+
+func (s *Store) migrate(ctx context.Context) error {
+	var version int
+	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		return fmt.Errorf("store: read schema version: %w", err)
+	}
+	for i := version; i < len(migrations); i++ {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, migrations[i]); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("store: migration %d: %w", i+1, err)
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", i+1)); err != nil {
+			tx.Rollback()
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Ms is t as Unix milliseconds.
+func Ms(t time.Time) int64 { return t.UnixMilli() }
+
+// Day is the UTC calendar day of t, the key of daily usage.
+func Day(t time.Time) string { return t.UTC().Format("2006-01-02") }
+
+// ── Registration links ──────────────────────────────────────────────────────────────────────────
+
+// CreateEmailToken stores a one-time link token by its hash.
+func (s *Store) CreateEmailToken(ctx context.Context, hash []byte, purpose, email, payload string, expires time.Time) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO email_tokens (token_hash, purpose, email, payload, expires_at) VALUES (?, ?, ?, ?, ?)`,
+		hash, purpose, email, payload, Ms(expires))
+	return err
+}
+
+// ConsumeEmailToken marks an unused, unexpired token used and returns its email and payload. ErrNotFound otherwise.
+func (s *Store) ConsumeEmailToken(ctx context.Context, hash []byte, purpose string, now time.Time) (email, payload string, err error) {
+	err = s.db.QueryRowContext(ctx, `UPDATE email_tokens SET used_at = ?
+		WHERE token_hash = ? AND purpose = ? AND used_at IS NULL AND expires_at > ?
+		RETURNING email, payload`, Ms(now), hash, purpose, Ms(now)).Scan(&email, &payload)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", ErrNotFound
+	}
+	return email, payload, err
+}
+
+// ── Instances ───────────────────────────────────────────────────────────────────────────────────
+
+// Instance is one registered beacon-server.
+type Instance struct {
+	ID, Name, Email, URL, Status string
+	SecretHash                   []byte
+	DomainVerifiedAt             int64 // 0: not verified
+	DomainCheckedAt              int64
+	QuotaPerMinute, QuotaPerDay  int // 0: the tier default
+	TermsVersion                 int
+	TermsAcceptedAt, CreatedAt   int64
+	CreatedIP                    string
+}
+
+const instanceCols = `id, name, email, url, status, secret_hash, domain_verified_at, domain_checked_at, quota_per_minute,
+	quota_per_day, terms_version, terms_accepted_at, created_at, created_ip`
+
+func scanInstance(row interface{ Scan(...any) error }) (Instance, error) {
+	var i Instance
+	err := row.Scan(&i.ID, &i.Name, &i.Email, &i.URL, &i.Status, &i.SecretHash, &i.DomainVerifiedAt, &i.DomainCheckedAt,
+		&i.QuotaPerMinute, &i.QuotaPerDay, &i.TermsVersion, &i.TermsAcceptedAt, &i.CreatedAt, &i.CreatedIP)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Instance{}, ErrNotFound
+	}
+	return i, err
+}
+
+// EmailBanned reports whether the email's hash is on the ban list.
+func (s *Store) EmailBanned(ctx context.Context, emailHash []byte) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM banned_emails WHERE email_hash = ?`, emailHash).Scan(&n)
+	return n > 0, err
+}
+
+// CountInstancesByEmail counts every server the email holds, banned and suspended ones included.
+func (s *Store) CountInstancesByEmail(ctx context.Context, email string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM instances WHERE email = ?`, email).Scan(&n)
+	return n, err
+}
+
+// CreateInstance inserts the server unless its email already holds max servers (ErrLimit), in one transaction so
+// two links clicked at once cannot both pass the check.
+func (s *Store) CreateInstance(ctx context.Context, i Instance, max int) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var n int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM instances WHERE email = ?`, i.Email).Scan(&n); err != nil {
+		return err
+	}
+	if n >= max {
+		return ErrLimit
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO instances (`+instanceCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		i.ID, i.Name, i.Email, i.URL, StatusActive, i.SecretHash, 0, 0, 0, 0, i.TermsVersion, i.TermsAcceptedAt, i.CreatedAt, i.CreatedIP); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// Instance returns the server with the ID, or ErrNotFound.
+func (s *Store) Instance(ctx context.Context, id string) (Instance, error) {
+	return scanInstance(s.db.QueryRowContext(ctx, `SELECT `+instanceCols+` FROM instances WHERE id = ?`, id))
+}
+
+// Instances lists every server, newest first.
+func (s *Store) Instances(ctx context.Context) ([]Instance, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+instanceCols+` FROM instances ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Instance
+	for rows.Next() {
+		i, err := scanInstance(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, i)
+	}
+	return out, rows.Err()
+}
+
+// DueForDomainCheck lists active servers with a URL whose domain was last checked before the time.
+func (s *Store) DueForDomainCheck(ctx context.Context, checkedBefore time.Time) ([]Instance, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+instanceCols+` FROM instances
+		WHERE status = 'active' AND url <> '' AND domain_checked_at < ? ORDER BY domain_checked_at`, Ms(checkedBefore))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Instance
+	for rows.Next() {
+		i, err := scanInstance(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, i)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) exec1(ctx context.Context, q string, args ...any) error {
+	res, err := s.db.ExecContext(ctx, q, args...)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetStatus changes a server's status. Banning also adds its email hash to the ban list.
+func (s *Store) SetStatus(ctx context.Context, id, status string, emailHash []byte, now time.Time) error {
+	if err := s.exec1(ctx, `UPDATE instances SET status = ? WHERE id = ?`, status, id); err != nil {
+		return err
+	}
+	if status == StatusBanned && emailHash != nil {
+		_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO banned_emails (email_hash, banned_at) VALUES (?, ?)`, emailHash, Ms(now))
+		return err
+	}
+	return nil
+}
+
+// SetQuota overrides a server's limits; 0 restores the tier default.
+func (s *Store) SetQuota(ctx context.Context, id string, perMinute, perDay int) error {
+	return s.exec1(ctx, `UPDATE instances SET quota_per_minute = ?, quota_per_day = ? WHERE id = ?`, perMinute, perDay, id)
+}
+
+// SetDomainCheck records a domain check. A pass keeps the first verification time; a failure clears it.
+func (s *Store) SetDomainCheck(ctx context.Context, id string, passed bool, now time.Time) error {
+	if passed {
+		return s.exec1(ctx, `UPDATE instances SET domain_checked_at = ?,
+			domain_verified_at = CASE WHEN domain_verified_at = 0 THEN ? ELSE domain_verified_at END WHERE id = ?`, Ms(now), Ms(now), id)
+	}
+	return s.exec1(ctx, `UPDATE instances SET domain_checked_at = ?, domain_verified_at = 0 WHERE id = ?`, Ms(now), id)
+}
+
+// ── Handles ─────────────────────────────────────────────────────────────────────────────────────
+
+// Handle is one device's registration with one server.
+type Handle struct {
+	Handle, InstanceID, Platform, FCMToken string
+	SecretHash                             []byte
+	CreatedAt, RefreshedAt                 int64
+	LastSentAt, RevokedAt                  int64 // 0: never / not revoked
+}
+
+// Handle returns the handle, or ErrNotFound.
+func (s *Store) Handle(ctx context.Context, handle string) (Handle, error) {
+	var h Handle
+	err := s.db.QueryRowContext(ctx, `SELECT handle, instance_id, platform, fcm_token, secret_hash, created_at, refreshed_at,
+		last_sent_at, revoked_at FROM handles WHERE handle = ?`, handle).
+		Scan(&h.Handle, &h.InstanceID, &h.Platform, &h.FCMToken, &h.SecretHash, &h.CreatedAt, &h.RefreshedAt, &h.LastSentAt, &h.RevokedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Handle{}, ErrNotFound
+	}
+	return h, err
+}
+
+// UpsertHandle registers a device token with a server. The same token on the same server keeps its handle and gets
+// the new secret; a revoked registration is replaced by a fresh handle. It returns the handle in use.
+func (s *Store) UpsertHandle(ctx context.Context, newHandle, instanceID, platform, token string, secretHash []byte, now time.Time) (string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	var existing string
+	var revoked int64
+	err = tx.QueryRowContext(ctx, `SELECT handle, revoked_at FROM handles WHERE instance_id = ? AND fcm_token = ?`, instanceID, token).Scan(&existing, &revoked)
+	switch {
+	case err == nil && revoked == 0:
+		if _, err := tx.ExecContext(ctx, `UPDATE handles SET secret_hash = ?, platform = ?, refreshed_at = ? WHERE handle = ?`,
+			secretHash, platform, Ms(now), existing); err != nil {
+			return "", err
+		}
+		return existing, tx.Commit()
+	case err == nil:
+		if _, err := tx.ExecContext(ctx, `DELETE FROM handles WHERE handle = ?`, existing); err != nil {
+			return "", err
+		}
+	case !errors.Is(err, sql.ErrNoRows):
+		return "", err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO handles (handle, secret_hash, instance_id, platform, fcm_token, created_at, refreshed_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, newHandle, secretHash, instanceID, platform, token, Ms(now), Ms(now)); err != nil {
+		return "", err
+	}
+	return newHandle, tx.Commit()
+}
+
+// RefreshHandleToken moves a handle to a new FCM token. Another registration of that token with the same server is
+// dropped, since the device now answers to this handle.
+func (s *Store) RefreshHandleToken(ctx context.Context, handle, instanceID, token string, now time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM handles WHERE instance_id = ? AND fcm_token = ? AND handle <> ?`, instanceID, token, handle); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE handles SET fcm_token = ?, refreshed_at = ? WHERE handle = ? AND revoked_at = 0`, token, Ms(now), handle)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return tx.Commit()
+}
+
+// RevokeHandle stops a handle from receiving anything.
+func (s *Store) RevokeHandle(ctx context.Context, handle string, now time.Time) error {
+	return s.exec1(ctx, `UPDATE handles SET revoked_at = ? WHERE handle = ? AND revoked_at = 0`, Ms(now), handle)
+}
+
+// CountHandles counts a server's live handles.
+func (s *Store) CountHandles(ctx context.Context, instanceID string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM handles WHERE instance_id = ? AND revoked_at = 0`, instanceID).Scan(&n)
+	return n, err
+}
+
+// ── Sends and usage ─────────────────────────────────────────────────────────────────────────────
+
+// Send is one send-log row. The ciphertext itself is never stored, only its hash.
+type Send struct {
+	MessageID, InstanceID, Handle, Status string
+	At                                    time.Time
+	Size                                  int
+	CiphertextSHA256                      []byte
+}
+
+// Usage field names for BumpUsage.
+const (
+	UsageSent          = "sent"
+	UsageRateLimited   = "rate_limited"
+	UsageInvalidHandle = "invalid_handle"
+)
+
+// RecordSend logs a delivered message and counts it.
+func (s *Store) RecordSend(ctx context.Context, r Send) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO send_log (message_id, instance_id, handle, at, size, ciphertext_sha256, status)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, r.MessageID, r.InstanceID, r.Handle, Ms(r.At), r.Size, r.CiphertextSHA256, r.Status); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE handles SET last_sent_at = ? WHERE handle = ?`, Ms(r.At), r.Handle); err != nil {
+		return err
+	}
+	if err := bump(ctx, tx, r.InstanceID, Day(r.At), UsageSent); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// BumpUsage adds one to a server's counter for the day.
+func (s *Store) BumpUsage(ctx context.Context, instanceID string, at time.Time, field string) error {
+	return bump(ctx, s.db, instanceID, Day(at), field)
+}
+
+func bump(ctx context.Context, db interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, instanceID, day, field string) error {
+	switch field {
+	case UsageSent, UsageRateLimited, UsageInvalidHandle:
+	default:
+		return fmt.Errorf("store: unknown usage field %q", field)
+	}
+	_, err := db.ExecContext(ctx, `INSERT INTO usage_daily (instance_id, day, `+field+`) VALUES (?, ?, 1)
+		ON CONFLICT (instance_id, day) DO UPDATE SET `+field+` = `+field+` + 1`, instanceID, day)
+	return err
+}
+
+// Usage is one server's counters for one day.
+type Usage struct {
+	Day                               string
+	Sent, RateLimited, InvalidHandles int
+}
+
+// UsageFor returns a server's counters for the most recent days, newest first.
+func (s *Store) UsageFor(ctx context.Context, instanceID string, days int) ([]Usage, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT day, sent, rate_limited, invalid_handle FROM usage_daily
+		WHERE instance_id = ? ORDER BY day DESC LIMIT ?`, instanceID, days)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Usage
+	for rows.Next() {
+		var u Usage
+		if err := rows.Scan(&u.Day, &u.Sent, &u.RateLimited, &u.InvalidHandles); err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// SentToday is what a server has sent on the day.
+func (s *Store) SentToday(ctx context.Context, instanceID string, at time.Time) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT coalesce(sum(sent), 0) FROM usage_daily WHERE instance_id = ? AND day = ?`, instanceID, Day(at)).Scan(&n)
+	return n, err
+}
+
+// GlobalSentToday is what every server together has sent on the day.
+func (s *Store) GlobalSentToday(ctx context.Context, at time.Time) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT coalesce(sum(sent), 0) FROM usage_daily WHERE day = ?`, Day(at)).Scan(&n)
+	return n, err
+}
+
+// HandleSentSince counts what reached a handle since the time.
+func (s *Store) HandleSentSince(ctx context.Context, handle string, since time.Time) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM send_log WHERE handle = ? AND at >= ?`, handle, Ms(since)).Scan(&n)
+	return n, err
+}
+
+// Retention periods.
+const (
+	SendLogKeep       = 30 * 24 * time.Hour
+	RevokedHandleKeep = 30 * 24 * time.Hour
+	UsageKeep         = 400 * 24 * time.Hour
+	TokenKeep         = 24 * time.Hour // after expiry
+)
+
+// Cleanup deletes what has outlived its retention period.
+func (s *Store) Cleanup(ctx context.Context, now time.Time) error {
+	for _, q := range []struct {
+		sql string
+		arg any
+	}{
+		{`DELETE FROM send_log WHERE at < ?`, Ms(now.Add(-SendLogKeep))},
+		{`DELETE FROM handles WHERE revoked_at <> 0 AND revoked_at < ?`, Ms(now.Add(-RevokedHandleKeep))},
+		{`DELETE FROM usage_daily WHERE day < ?`, Day(now.Add(-UsageKeep))},
+		{`DELETE FROM email_tokens WHERE expires_at < ?`, Ms(now.Add(-TokenKeep))},
+	} {
+		if _, err := s.db.ExecContext(ctx, q.sql, q.arg); err != nil {
+			return err
+		}
+	}
+	return nil
+}

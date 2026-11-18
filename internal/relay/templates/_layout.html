@@ -1,0 +1,25 @@
+{{define "head"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>{{.}} · Beacon Push</title>
+<link rel="stylesheet" href="/static/site.css">
+</head>
+<body>
+<header><a href="/" class="brand">BEACON <span>Push</span></a></header>
+<main>
+{{end}}
+
+{{define "foot"}}
+</main>
+<footer>
+<a href="/register">Register a server</a> · <a href="/terms">Terms</a> · <a href="/privacy">Privacy</a> ·
+<a href="https://github.com/MeshCore-Beacon/beacon-push">Source</a> · Abuse: <a href="mailto:abuse@meshcorebeacon.ca">abuse@meshcorebeacon.ca</a>
+</footer>
+</body>
+</html>
+{{end}}
+
+{{define "error"}}{{if .}}<p class="error" role="alert">{{.}}</p>{{end}}{{end}}

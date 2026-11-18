@@ -72,8 +72,9 @@ const (
 	DeferredRetry     = 5 * time.Second  // an item not started before the deadline
 	InFlightRetry     = 30 * time.Second // an id whose earlier send has no answer yet
 	FCMPauseDefault   = time.Minute      // after FCM 500/503 without Retry-After; doubles while outages repeat
-	FCMPauseMax       = time.Hour
-	FCMThrottleRetry  = time.Minute // after FCM 429 without Retry-After
+	FCMPauseMax       = time.Hour        // cap on the computed backoff
+	FCMWaitMax        = 24 * time.Hour   // sanity cap on a Retry-After FCM sends
+	FCMThrottleRetry  = time.Minute      // after FCM 429 without Retry-After
 	finishSendTimeout = 5 * time.Second
 )
 
@@ -188,8 +189,8 @@ func (s *Server) pausedFor(now time.Time) time.Duration {
 	return s.pausedUntil.Sub(now)
 }
 
-// pauseFCM stops every send for FCM's Retry-After, or a default that doubles with each new outage, at most an hour.
-// It returns the wait it applied.
+// pauseFCM stops every send for FCM's Retry-After (at most a day), or a default that doubles with each new outage,
+// at most an hour. It returns how long the pause now lasts.
 func (s *Server) pauseFCM(now time.Time, d time.Duration) time.Duration {
 	s.pauseMu.Lock()
 	defer s.pauseMu.Unlock()
@@ -197,25 +198,29 @@ func (s *Server) pauseFCM(now time.Time, d time.Duration) time.Duration {
 	if !now.Before(s.pausedUntil) {
 		s.pauseStreak++
 	}
-	if d <= 0 {
-		d = FCMPauseDefault << min(s.pauseStreak-1, 6)
+	if d > 0 {
+		d = min(d, FCMWaitMax)
+	} else {
+		d = min(FCMPauseDefault<<min(max(s.pauseStreak-1, 0), 6), FCMPauseMax)
 	}
-	d = min(d, FCMPauseMax)
 	if until := now.Add(d); until.After(s.pausedUntil) {
 		s.pausedUntil = until
 	}
-	return d
+	return s.pausedUntil.Sub(now)
 }
 
-// fcmRecovered resets the outage backoff after a successful send.
-func (s *Server) fcmRecovered() {
+// fcmRecovered resets the outage backoff after a successful send, unless a pause is still on: a send that was in
+// flight when FCM went down says nothing about the outage being over.
+func (s *Server) fcmRecovered(now time.Time) {
 	s.pauseMu.Lock()
-	s.pauseStreak = 0
+	if !now.Before(s.pausedUntil) {
+		s.pauseStreak = 0
+	}
 	s.pauseMu.Unlock()
 }
 
-// coolHandle keeps sends away from a handle FCM throttled.
-func (s *Server) coolHandle(handle string, until, now time.Time) {
+// coolHandle keeps sends away from a handle FCM throttled, keeping the later expiry, which it returns.
+func (s *Server) coolHandle(handle string, until, now time.Time) time.Time {
 	s.coolMu.Lock()
 	defer s.coolMu.Unlock()
 	if len(s.cool) > 10_000 {
@@ -225,7 +230,11 @@ func (s *Server) coolHandle(handle string, until, now time.Time) {
 			}
 		}
 	}
+	if cur := s.cool[handle]; cur.After(until) {
+		until = cur
+	}
 	s.cool[handle] = until
+	return until
 }
 
 // cooledFor is how long a throttled handle still waits.

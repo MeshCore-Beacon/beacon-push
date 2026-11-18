@@ -406,14 +406,14 @@ func TestFCMOutagePausesTheRelay(t *testing.T) {
 		t.Fatalf("after the pause: %+v", res)
 	}
 
-	// No Retry-After pauses a minute; a huge one is capped at an hour.
+	// No Retry-After pauses a minute; FCM's own wait is kept even past the hour the backoff stops at.
 	h.push.set(func(f *fakePush) { f.errs["tok-0"] = &fcm.Error{Status: 500} })
 	if res, _ := h.send(auth, items(devs[0])...); res[0].RetryAfterSeconds != 60 {
 		t.Fatalf("%+v", res)
 	}
 	h.clock.add(61 * time.Second)
 	h.push.set(func(f *fakePush) { f.errs["tok-0"] = &fcm.Error{Status: 503, RetryAfter: 5 * time.Hour} })
-	if res, _ := h.send(auth, items(devs[0])...); res[0].RetryAfterSeconds != 3600 {
+	if res, _ := h.send(auth, items(devs[0])...); res[0].RetryAfterSeconds != 5*3600 {
 		t.Fatalf("%+v", res)
 	}
 }
@@ -586,5 +586,85 @@ func TestRepeatedOutagesBackOff(t *testing.T) {
 	h.clock.add(time.Minute)
 	if res, _ := h.send(auth, items(dev)...); res[0].RetryAfterSeconds != 60 {
 		t.Fatalf("a success must reset the backoff: %+v", res)
+	}
+}
+
+func TestSuccessDuringAPauseKeepsItAndCannotPanic(t *testing.T) {
+	h := newHarness(t)
+	now := h.clock.now()
+	// 503, success, 503 from three sends that were in flight together.
+	h.relay.pauseFCM(now, 0)
+	h.relay.fcmRecovered(now)
+	if d := h.relay.pauseFCM(now, 0); d != FCMPauseDefault {
+		t.Fatalf("pause %s", d)
+	}
+	if d := h.relay.pausedFor(now); d != FCMPauseDefault {
+		t.Fatalf("a success cleared an outstanding pause: %s left", d)
+	}
+	// The outage goes on after the pause: the backoff did not restart.
+	h.clock.add(FCMPauseDefault)
+	if d := h.relay.pauseFCM(h.clock.now(), 0); d != 2*FCMPauseDefault {
+		t.Fatalf("next pause %s", d)
+	}
+}
+
+func TestWorkerPanicFailsOnlyThatItem(t *testing.T) {
+	h := newHarness(t)
+	id, auth := h.register("A", "a@example.org", "")
+	devs := h.devices(id, 2)
+	h.push.set(func(f *fakePush) {
+		f.hook = func(m fcm.Message) error {
+			if m.Token == "tok-0" {
+				panic("boom")
+			}
+			return nil
+		}
+	})
+	res, resp := h.send(auth, items(devs...)...)
+	if resp.StatusCode != 200 || res[0].Status != StatusFailed || res[1].Status != StatusOK {
+		t.Fatalf("%d %+v", resp.StatusCode, res)
+	}
+}
+
+func TestDuplicateIDInABatchSpendsNoLimit(t *testing.T) {
+	h := newHarness(t)
+	id, auth := h.register("A", "a@example.org", "")
+	dev := h.devices(id, 1)[0]
+	if err := h.store.SetQuota(context.Background(), id, 1, 10_000); err != nil {
+		t.Fatal(err)
+	}
+	h.relay.sendWorkers = 1
+	item := SendItem{Handle: dev, Ciphertext: ct, ID: "9:dup"}
+	res, _ := h.send(auth, item, item)
+	if res[0].Status != StatusOK || res[1].Status != StatusOK || res[1].MessageID != res[0].MessageID || len(h.push.messages()) != 1 {
+		t.Fatalf("%+v", res)
+	}
+	if u, _ := h.store.UsageFor(context.Background(), id, 1); u[0].RateLimited != 0 || u[0].Sent != 1 {
+		t.Fatalf("%+v", u)
+	}
+}
+
+func TestCooldownKeepsTheLaterExpiry(t *testing.T) {
+	h := newHarness(t)
+	now := h.clock.now()
+	h.relay.coolHandle("h_x", now.Add(time.Hour), now)
+	if until := h.relay.coolHandle("h_x", now.Add(time.Minute), now); !until.Equal(now.Add(time.Hour)) {
+		t.Fatalf("effective expiry %s", until)
+	}
+	if d := h.relay.cooledFor("h_x", now); d != time.Hour {
+		t.Fatalf("cooldown shrank to %s", d)
+	}
+}
+
+func TestFCMThrottleKeepsALongWait(t *testing.T) {
+	h := newHarness(t)
+	id, auth := h.register("A", "a@example.org", "")
+	dev := h.devices(id, 1)[0]
+	h.push.set(func(f *fakePush) { f.errs["tok-0"] = &fcm.Error{Status: 429, RetryAfter: 2 * time.Hour} })
+	if res, _ := h.send(auth, items(dev)...); res[0].RetryAfterSeconds != 7200 {
+		t.Fatalf("%+v", res)
+	}
+	if d := h.relay.cooledFor(dev, h.clock.now()); d != 2*time.Hour {
+		t.Fatalf("cooldown %s", d)
 	}
 }

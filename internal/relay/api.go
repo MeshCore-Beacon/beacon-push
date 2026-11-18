@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"sync"
@@ -232,7 +233,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, inst store.Instanc
 		go func() {
 			defer wg.Done()
 			for j := range next {
-				results[j.i] = s.sendOne(ctx, b, j)
+				results[j.i] = s.sendSafely(ctx, b, j)
 			}
 		}()
 	}
@@ -275,11 +276,35 @@ func (s *Server) storeFailed(b *batch, what string, err error) SendResult {
 	return SendResult{Status: StatusFailed}
 }
 
+// sendSafely is sendOne in a worker goroutine, where a panic would end the process: it fails only that item.
+func (s *Server) sendSafely(ctx context.Context, b *batch, j sendJob) (res SendResult) {
+	defer func() {
+		if p := recover(); p != nil {
+			s.log.Error("send panicked", "component", "relay", "push_id", b.inst.ID, "panic", fmt.Sprint(p))
+			res = SendResult{Status: StatusFailed}
+		}
+	}()
+	return s.sendOne(ctx, b, j)
+}
+
 // sendOne reserves quota for one item, hands it to FCM and records the answer.
 func (s *Server) sendOne(ctx context.Context, b *batch, j sendJob) SendResult {
 	inst, h := b.inst, j.handle
 	if b.stop.Load() {
 		return SendResult{Status: StatusFailed}
+	}
+	// An id another worker of this batch already sent gets that answer before anything is spent, and one still in
+	// flight waits without spending a rate limit. Reserve decides for real.
+	if j.item.ID != "" {
+		st, msgID, at, err := s.store.SentByClientID(b.db, inst.ID, j.item.ID)
+		switch {
+		case err == nil && st == store.SendOK:
+			return SendResult{MessageID: msgID, Status: StatusOK}
+		case err == nil && st == store.SendPending && b.now.Sub(at) < store.PendingTimeout:
+			return s.limited(b, InFlightRetry)
+		case err != nil && !errors.Is(err, store.ErrNotFound):
+			return s.storeFailed(b, "send lookup failed", err)
+		}
 	}
 	if time.Now().After(b.deadline) || ctx.Err() != nil {
 		return s.limited(b, DeferredRetry)
@@ -289,16 +314,6 @@ func (s *Server) sendOne(ctx context.Context, b *batch, j sendJob) SendResult {
 	}
 	if d := s.cooledFor(h.Handle, s.now()); d > 0 {
 		return s.limited(b, d)
-	}
-	if j.item.ID != "" {
-		// A cheap look first, so a repeat in flight spends no rate limit. Reserve decides for real.
-		st, _, at, err := s.store.SentByClientID(b.db, inst.ID, j.item.ID)
-		switch {
-		case err == nil && st == store.SendPending && b.now.Sub(at) < store.PendingTimeout:
-			return s.limited(b, InFlightRetry)
-		case err != nil && !errors.Is(err, store.ErrNotFound):
-			return s.storeFailed(b, "send lookup failed", err)
-		}
 	}
 	// The current row, so a quota changed mid-batch applies to what has not gone out yet.
 	cur, err := s.store.Instance(b.db, inst.ID)
@@ -367,7 +382,7 @@ func (s *Server) sendOne(ctx context.Context, b *batch, j sendJob) SendResult {
 	var fe *fcm.Error
 	switch {
 	case err == nil:
-		s.fcmRecovered()
+		s.fcmRecovered(s.now())
 		return SendResult{MessageID: msgID, Status: StatusOK}
 	case errors.Is(err, fcm.ErrUnregistered):
 		uctx, ucancel := context.WithTimeout(b.db, finishSendTimeout)
@@ -376,13 +391,12 @@ func (s *Server) sendOne(ctx context.Context, b *batch, j sendJob) SendResult {
 	case errors.Is(err, fcm.ErrInvalidArgument):
 		return SendResult{Status: StatusInvalid}
 	case errors.As(err, &fe) && fe.Status == http.StatusTooManyRequests:
-		d := fe.RetryAfter
+		d := min(fe.RetryAfter, FCMWaitMax)
 		if d <= 0 {
 			d = FCMThrottleRetry
 		}
-		d = min(d, FCMPauseMax)
-		s.coolHandle(h.Handle, s.now().Add(d), s.now())
-		return s.limited(b, d)
+		now := s.now()
+		return s.limited(b, s.coolHandle(h.Handle, now.Add(d), now).Sub(now))
 	case errors.As(err, &fe) && (fe.Status == http.StatusInternalServerError || fe.Status == http.StatusServiceUnavailable):
 		d := s.pauseFCM(s.now(), fe.RetryAfter)
 		s.log.Warn("fcm unavailable, relay paused", "component", "relay", "status", fe.Status, "pause", d.String())

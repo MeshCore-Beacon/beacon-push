@@ -196,7 +196,7 @@ func (h *harness) register(name, email, serverURL string) (string, string) {
 func (h *harness) handle(pushID, token string) HandleResponse {
 	h.t.Helper()
 	var out HandleResponse
-	if resp := h.api("POST", "/v1/handles", "", HandleRequest{PushID: pushID, Platform: "android", FCMToken: token}, &out); resp.StatusCode != 200 {
+	if resp := h.api("POST", "/v1/handles", "", HandleRequest{PushID: pushID, Platform: "android", Token: token}, &out); resp.StatusCode != 200 {
 		h.t.Fatalf("handle: %d", resp.StatusCode)
 	}
 	return out
@@ -358,10 +358,10 @@ func TestHandleRefreshAndDelete(t *testing.T) {
 	dev := h.handle(id, "tok-1")
 	path := "/v1/handles/" + dev.Handle
 
-	if resp := h.api("PUT", path, "", HandleUpdate{HandleSecret: "wrong", FCMToken: "tok-2"}, nil); resp.StatusCode != 404 {
+	if resp := h.api("PUT", path, "", HandleUpdate{HandleSecret: "wrong", Token: "tok-2"}, nil); resp.StatusCode != 404 {
 		t.Fatalf("wrong secret: %d", resp.StatusCode)
 	}
-	if resp := h.api("PUT", path, "", HandleUpdate{HandleSecret: dev.HandleSecret, FCMToken: "tok-2"}, nil); resp.StatusCode != 204 {
+	if resp := h.api("PUT", path, "", HandleUpdate{HandleSecret: dev.HandleSecret, Token: "tok-2"}, nil); resp.StatusCode != 204 {
 		t.Fatalf("refresh: %d", resp.StatusCode)
 	}
 	h.send(auth, SendItem{Handle: dev.Handle, Ciphertext: ct})
@@ -470,7 +470,7 @@ func TestSuspendAndBan(t *testing.T) {
 	if _, resp := h.send(auth, SendItem{Handle: dev.Handle, Ciphertext: ct}); resp.StatusCode != 403 {
 		t.Fatalf("suspended send: %d", resp.StatusCode)
 	}
-	if resp := h.api("POST", "/v1/handles", "", HandleRequest{PushID: id, Platform: "ios", FCMToken: "t2"}, nil); resp.StatusCode != 403 {
+	if resp := h.api("POST", "/v1/handles", "", HandleRequest{PushID: id, Platform: "android", Token: "t2"}, nil); resp.StatusCode != 403 {
 		t.Fatalf("suspended handle: %d", resp.StatusCode)
 	}
 

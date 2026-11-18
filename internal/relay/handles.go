@@ -8,17 +8,20 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/MeshCore-Beacon/beacon-push/internal/push"
 	"github.com/MeshCore-Beacon/beacon-push/internal/store"
 )
 
 // HandleRequest registers a device with one server.
 type HandleRequest struct {
-	PushID   string `json:"pushId"`
-	Platform string `json:"platform" enums:"ios,android"`
-	FCMToken string `json:"fcmToken"`
+	PushID          string `json:"pushId"`
+	Platform        string `json:"platform" enums:"ios,android"`
+	Token           string `json:"token"`                                                // APNs device token on iOS, FCM token on Android
+	APNSEnvironment string `json:"apnsEnvironment,omitempty" enums:"sandbox,production"` // iOS only, required there
 }
 
 // HandleResponse is the device's handle for that server and the secret that lets the app change or delete it.
@@ -27,10 +30,11 @@ type HandleResponse struct {
 	HandleSecret string `json:"handleSecret"`
 }
 
-// HandleUpdate is the app proving it owns a handle, with a new token when the token changed.
+// HandleUpdate is the app proving it owns a handle, with the current token (and APNs environment on iOS) on a refresh.
 type HandleUpdate struct {
-	HandleSecret string `json:"handleSecret"`
-	FCMToken     string `json:"fcmToken,omitempty"`
+	HandleSecret    string `json:"handleSecret"`
+	Token           string `json:"token,omitempty"`
+	APNSEnvironment string `json:"apnsEnvironment,omitempty" enums:"sandbox,production"`
 }
 
 // validToken takes the characters FCM registration tokens are made of, so a mangled token is refused up front.
@@ -49,6 +53,45 @@ func validToken(t string) bool {
 	return true
 }
 
+// validAPNsToken takes an APNs device token: hex, a whole number of bytes, 32 to 100 of them.
+func validAPNsToken(t string) bool {
+	if len(t) < 64 || len(t) > 200 || len(t)%2 != 0 {
+		return false
+	}
+	for i := 0; i < len(t); i++ {
+		c := t[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+// checkDevice validates a token and APNs environment for the platform, answering 400 when they do not fit. It
+// returns the token as stored.
+func checkDevice(w http.ResponseWriter, platform, token, env string) (string, bool) {
+	if platform == push.IOS {
+		if env != push.Sandbox && env != push.Production {
+			writeError(w, http.StatusBadRequest, "bad_apns_environment", "apnsEnvironment must be sandbox or production on iOS.")
+			return "", false
+		}
+		if !validAPNsToken(token) {
+			writeError(w, http.StatusBadRequest, "bad_token", "token is missing or not an APNs device token.")
+			return "", false
+		}
+		return strings.ToLower(token), true
+	}
+	if env != "" {
+		writeError(w, http.StatusBadRequest, "bad_apns_environment", "apnsEnvironment is only for iOS.")
+		return "", false
+	}
+	if !validToken(token) {
+		writeError(w, http.StatusBadRequest, "bad_token", "token is missing or malformed.")
+		return "", false
+	}
+	return token, true
+}
+
 func (s *Server) createHandle(w http.ResponseWriter, r *http.Request) {
 	now := s.now()
 	if ok, wait := s.hour.Allow("handle-create:"+s.clientIP(r), HandleCreatesPerHour, now); !ok {
@@ -59,12 +102,12 @@ func (s *Server) createHandle(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	if req.Platform != "ios" && req.Platform != "android" {
+	if req.Platform != push.IOS && req.Platform != push.Android {
 		writeError(w, http.StatusBadRequest, "bad_platform", "platform must be ios or android.")
 		return
 	}
-	if !validToken(req.FCMToken) {
-		writeError(w, http.StatusBadRequest, "bad_token", "fcmToken is missing or malformed.")
+	token, ok := checkDevice(w, req.Platform, req.Token, req.APNSEnvironment)
+	if !ok {
 		return
 	}
 	inst, err := s.store.Instance(r.Context(), req.PushID)
@@ -81,7 +124,7 @@ func (s *Server) createHandle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	secret := randomString(32)
-	handle, err := s.store.UpsertHandle(r.Context(), "h_"+randomString(16), inst.ID, req.Platform, req.FCMToken, hash(secret), now)
+	handle, err := s.store.UpsertHandle(r.Context(), "h_"+randomString(16), inst.ID, req.Platform, token, req.APNSEnvironment, hash(secret), now)
 	if err != nil {
 		s.internal(w, "handle not stored", err)
 		return
@@ -135,15 +178,16 @@ func (s *Server) refreshHandle(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	if !validToken(req.FCMToken) {
-		writeError(w, http.StatusBadRequest, "bad_token", "fcmToken is missing or malformed.")
-		return
-	}
 	h, ok := s.ownedHandle(w, r, req.HandleSecret)
 	if !ok {
 		return
 	}
-	if err := s.store.RefreshHandleToken(r.Context(), h.Handle, h.InstanceID, req.FCMToken, now); err != nil {
+	// The handle's platform decides what a valid token is, so ownership is checked first.
+	token, ok := checkDevice(w, h.Platform, req.Token, req.APNSEnvironment)
+	if !ok {
+		return
+	}
+	if err := s.store.RefreshHandleToken(r.Context(), h.Handle, h.InstanceID, token, req.APNSEnvironment, now); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "unknown_handle", "No such handle, or the handle secret is wrong.")
 			return

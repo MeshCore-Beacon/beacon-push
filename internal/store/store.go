@@ -94,11 +94,35 @@ var migrations = []string{
 		invalid_handle INTEGER NOT NULL DEFAULT 0,
 		PRIMARY KEY (instance_id, day)
 	);`,
-	// client_id is the sender's idempotency key; status is pending until FCM answers, then ok or failed.
+	// client_id is the sender's idempotency key; status is pending until the provider answers, then ok or failed.
 	`ALTER TABLE send_log ADD COLUMN client_id TEXT;
 	CREATE UNIQUE INDEX idx_send_log_client ON send_log (instance_id, client_id) WHERE client_id IS NOT NULL;`,
 	// Keeps the search for abandoned pending sends cheap enough to run on every reservation.
 	`CREATE INDEX idx_send_log_pending ON send_log (at) WHERE status = 'pending';`,
+	// iOS goes straight to APNs: fcm_token becomes token, and an iOS handle names its APNs environment. Live iOS
+	// handles from before hold FCM tokens APNs cannot use, so they are revoked and the app registers again.
+	`CREATE TABLE handles_new (
+		handle TEXT PRIMARY KEY,
+		secret_hash BLOB NOT NULL,
+		instance_id TEXT NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+		platform TEXT NOT NULL CHECK (platform IN ('ios', 'android')),
+		token TEXT NOT NULL,
+		apns_env TEXT,
+		created_at INTEGER NOT NULL,
+		refreshed_at INTEGER NOT NULL,
+		last_sent_at INTEGER NOT NULL DEFAULT 0,
+		revoked_at INTEGER NOT NULL DEFAULT 0,
+		UNIQUE (instance_id, token),
+		CHECK ((platform = 'android' AND apns_env IS NULL) OR (platform = 'ios' AND
+			(coalesce(apns_env, '') IN ('sandbox', 'production') OR (apns_env IS NULL AND revoked_at <> 0))))
+	);
+	INSERT INTO handles_new (handle, secret_hash, instance_id, platform, token, apns_env, created_at, refreshed_at,
+		last_sent_at, revoked_at)
+	SELECT handle, secret_hash, instance_id, platform, fcm_token, NULL, created_at, refreshed_at, last_sent_at,
+		CASE WHEN platform = 'ios' AND revoked_at = 0 THEN CAST(strftime('%s', 'now') AS INTEGER) * 1000 ELSE revoked_at END
+	FROM handles;
+	DROP TABLE handles;
+	ALTER TABLE handles_new RENAME TO handles;`,
 }
 
 // Open opens (creating if needed) the database at path and brings its schema up to date.
@@ -334,27 +358,37 @@ func (s *Store) SetDomainCheck(ctx context.Context, id string, passed bool, now 
 
 // Handle is one device's registration with one server.
 type Handle struct {
-	Handle, InstanceID, Platform, FCMToken string
-	SecretHash                             []byte
-	CreatedAt, RefreshedAt                 int64
-	LastSentAt, RevokedAt                  int64 // 0: never / not revoked
+	Handle, InstanceID, Platform, Token string
+	APNsEnv                             string // sandbox or production on iOS, empty on Android
+	SecretHash                          []byte
+	CreatedAt, RefreshedAt              int64
+	LastSentAt, RevokedAt               int64 // 0: never / not revoked
 }
 
 // Handle returns the handle, or ErrNotFound.
 func (s *Store) Handle(ctx context.Context, handle string) (Handle, error) {
 	var h Handle
-	err := s.db.QueryRowContext(ctx, `SELECT handle, instance_id, platform, fcm_token, secret_hash, created_at, refreshed_at,
-		last_sent_at, revoked_at FROM handles WHERE handle = ?`, handle).
-		Scan(&h.Handle, &h.InstanceID, &h.Platform, &h.FCMToken, &h.SecretHash, &h.CreatedAt, &h.RefreshedAt, &h.LastSentAt, &h.RevokedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT handle, instance_id, platform, token, coalesce(apns_env, ''), secret_hash, created_at,
+		refreshed_at, last_sent_at, revoked_at FROM handles WHERE handle = ?`, handle).
+		Scan(&h.Handle, &h.InstanceID, &h.Platform, &h.Token, &h.APNsEnv, &h.SecretHash, &h.CreatedAt, &h.RefreshedAt, &h.LastSentAt, &h.RevokedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Handle{}, ErrNotFound
 	}
 	return h, err
 }
 
+// nullable stores an empty string as NULL.
+func nullable(v string) any {
+	if v == "" {
+		return nil
+	}
+	return v
+}
+
 // UpsertHandle registers a device token with a server. The same token on the same server keeps its handle and gets
-// the new secret; a revoked registration is replaced by a fresh handle. It returns the handle in use.
-func (s *Store) UpsertHandle(ctx context.Context, newHandle, instanceID, platform, token string, secretHash []byte, now time.Time) (string, error) {
+// the new secret; a revoked registration is replaced by a fresh handle. It returns the handle in use. apnsEnv is
+// sandbox or production for iOS and empty for Android.
+func (s *Store) UpsertHandle(ctx context.Context, newHandle, instanceID, platform, token, apnsEnv string, secretHash []byte, now time.Time) (string, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return "", err
@@ -362,11 +396,11 @@ func (s *Store) UpsertHandle(ctx context.Context, newHandle, instanceID, platfor
 	defer tx.Rollback()
 	var existing string
 	var revoked int64
-	err = tx.QueryRowContext(ctx, `SELECT handle, revoked_at FROM handles WHERE instance_id = ? AND fcm_token = ?`, instanceID, token).Scan(&existing, &revoked)
+	err = tx.QueryRowContext(ctx, `SELECT handle, revoked_at FROM handles WHERE instance_id = ? AND token = ?`, instanceID, token).Scan(&existing, &revoked)
 	switch {
 	case err == nil && revoked == 0:
-		if _, err := tx.ExecContext(ctx, `UPDATE handles SET secret_hash = ?, platform = ?, refreshed_at = ? WHERE handle = ?`,
-			secretHash, platform, Ms(now), existing); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE handles SET secret_hash = ?, platform = ?, apns_env = ?, refreshed_at = ? WHERE handle = ?`,
+			secretHash, platform, nullable(apnsEnv), Ms(now), existing); err != nil {
 			return "", err
 		}
 		return existing, tx.Commit()
@@ -377,25 +411,26 @@ func (s *Store) UpsertHandle(ctx context.Context, newHandle, instanceID, platfor
 	case !errors.Is(err, sql.ErrNoRows):
 		return "", err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO handles (handle, secret_hash, instance_id, platform, fcm_token, created_at, refreshed_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`, newHandle, secretHash, instanceID, platform, token, Ms(now), Ms(now)); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO handles (handle, secret_hash, instance_id, platform, token, apns_env, created_at, refreshed_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, newHandle, secretHash, instanceID, platform, token, nullable(apnsEnv), Ms(now), Ms(now)); err != nil {
 		return "", err
 	}
 	return newHandle, tx.Commit()
 }
 
-// RefreshHandleToken moves a handle to a new FCM token. Another registration of that token with the same server is
-// dropped, since the device now answers to this handle.
-func (s *Store) RefreshHandleToken(ctx context.Context, handle, instanceID, token string, now time.Time) error {
+// RefreshHandleToken moves a handle to a new device token and, on iOS, APNs environment. Another registration of
+// that token with the same server is dropped, since the device now answers to this handle.
+func (s *Store) RefreshHandleToken(ctx context.Context, handle, instanceID, token, apnsEnv string, now time.Time) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM handles WHERE instance_id = ? AND fcm_token = ? AND handle <> ?`, instanceID, token, handle); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM handles WHERE instance_id = ? AND token = ? AND handle <> ?`, instanceID, token, handle); err != nil {
 		return err
 	}
-	res, err := tx.ExecContext(ctx, `UPDATE handles SET fcm_token = ?, refreshed_at = ? WHERE handle = ? AND revoked_at = 0`, token, Ms(now), handle)
+	res, err := tx.ExecContext(ctx, `UPDATE handles SET token = ?, apns_env = ?, refreshed_at = ? WHERE handle = ? AND revoked_at = 0`,
+		token, nullable(apnsEnv), Ms(now), handle)
 	if err != nil {
 		return err
 	}
@@ -413,7 +448,7 @@ func (s *Store) RevokeHandle(ctx context.Context, handle string, now time.Time) 
 // RevokeHandleToken revokes a handle only while it still has the token, so a failure for an old token cannot
 // revoke a handle the app has since refreshed. ErrNotFound when the token changed or the handle is gone.
 func (s *Store) RevokeHandleToken(ctx context.Context, handle, token string, now time.Time) error {
-	return s.exec1(ctx, `UPDATE handles SET revoked_at = ? WHERE handle = ? AND fcm_token = ? AND revoked_at = 0`, Ms(now), handle, token)
+	return s.exec1(ctx, `UPDATE handles SET revoked_at = ? WHERE handle = ? AND token = ? AND revoked_at = 0`, Ms(now), handle, token)
 }
 
 // CountHandles counts a server's live handles.
@@ -425,7 +460,7 @@ func (s *Store) CountHandles(ctx context.Context, instanceID string) (int, error
 
 // ── Sends and usage ─────────────────────────────────────────────────────────────────────────────
 
-// Send-log statuses. A pending row holds its quota until FCM answers.
+// Send-log statuses. A pending row holds its quota until the push provider answers.
 const (
 	SendPending = "pending"
 	SendOK      = "ok"
@@ -442,7 +477,7 @@ const (
 	UsageInvalidHandle = "invalid_handle"
 )
 
-// Reservation asks to count one send before it goes to FCM. The ciphertext itself is never stored, only its hash.
+// Reservation asks to count one send before it goes to its push provider. The ciphertext itself is never stored, only its hash.
 type Reservation struct {
 	MessageID, InstanceID, Handle string
 	ClientID                      string // the sender's idempotency key; empty for none
@@ -553,7 +588,7 @@ func (s *Store) Reserve(ctx context.Context, r Reservation) (Outcome, string, er
 	return Reserved, r.MessageID, tx.Commit()
 }
 
-// FinishSend records FCM's answer for a reserved send. A send that did not go out gives its quota back.
+// FinishSend records the provider's answer for a reserved send. A send that did not go out gives its quota back.
 func (s *Store) FinishSend(ctx context.Context, messageID string, ok bool, at time.Time) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

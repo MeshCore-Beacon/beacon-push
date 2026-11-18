@@ -99,19 +99,19 @@ func TestHandleLifecycle(t *testing.T) {
 	s := open(t)
 	ctx := context.Background()
 	_ = s.CreateInstance(ctx, inst("inst_a", "a@x.org"), 2)
-	h1, err := s.UpsertHandle(ctx, "h_1", "inst_a", "ios", "tok", []byte("s1"), t0)
+	h1, err := s.UpsertHandle(ctx, "h_1", "inst_a", "ios", "tok", "sandbox", []byte("s1"), t0)
 	if err != nil || h1 != "h_1" {
 		t.Fatalf("%q %v", h1, err)
 	}
-	if h, _ := s.UpsertHandle(ctx, "h_2", "inst_a", "ios", "tok", []byte("s2"), t0); h != "h_1" {
+	if h, _ := s.UpsertHandle(ctx, "h_2", "inst_a", "ios", "tok", "sandbox", []byte("s2"), t0); h != "h_1" {
 		t.Fatalf("same token: %q", h)
 	}
 	if got, _ := s.Handle(ctx, "h_1"); string(got.SecretHash) != "s2" {
 		t.Fatal("secret not replaced")
 	}
 	// A second handle that later refreshes onto the first one's token takes it over.
-	_, _ = s.UpsertHandle(ctx, "h_3", "inst_a", "android", "other", []byte("s3"), t0)
-	if err := s.RefreshHandleToken(ctx, "h_3", "inst_a", "tok", t0); err != nil {
+	_, _ = s.UpsertHandle(ctx, "h_3", "inst_a", "android", "other", "", []byte("s3"), t0)
+	if err := s.RefreshHandleToken(ctx, "h_3", "inst_a", "tok", "", t0); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.Handle(ctx, "h_1"); !errors.Is(err, ErrNotFound) {
@@ -123,7 +123,7 @@ func TestHandleLifecycle(t *testing.T) {
 	if n, _ := s.CountHandles(ctx, "inst_a"); n != 0 {
 		t.Fatalf("live handles %d", n)
 	}
-	if h, _ := s.UpsertHandle(ctx, "h_4", "inst_a", "android", "tok", []byte("s4"), t0); h != "h_4" {
+	if h, _ := s.UpsertHandle(ctx, "h_4", "inst_a", "android", "tok", "", []byte("s4"), t0); h != "h_4" {
 		t.Fatalf("a revoked registration must be replaced: %q", h)
 	}
 }
@@ -132,7 +132,7 @@ func TestUsageAndCleanup(t *testing.T) {
 	s := open(t)
 	ctx := context.Background()
 	_ = s.CreateInstance(ctx, inst("inst_a", "a@x.org"), 2)
-	_, _ = s.UpsertHandle(ctx, "h_1", "inst_a", "ios", "tok", []byte("s"), t0)
+	_, _ = s.UpsertHandle(ctx, "h_1", "inst_a", "ios", "tok", "sandbox", []byte("s"), t0)
 	for i, at := range []time.Time{t0.Add(-40 * 24 * time.Hour), t0} {
 		id := "m_" + string(rune('a'+i))
 		if o, _, err := s.Reserve(ctx, reservation(id, "h_1", "", at)); err != nil || o != Reserved {
@@ -203,7 +203,7 @@ func TestReserveCountsPendingSends(t *testing.T) {
 	ctx := context.Background()
 	_ = s.CreateInstance(ctx, inst("inst_a", "a@x.org"), 2)
 	_ = s.CreateInstance(ctx, inst("inst_b", "b@x.org"), 2)
-	_, _ = s.UpsertHandle(ctx, "h_1", "inst_a", "ios", "tok", []byte("s"), t0)
+	_, _ = s.UpsertHandle(ctx, "h_1", "inst_a", "ios", "tok", "sandbox", []byte("s"), t0)
 
 	// A pending send already holds the device's, the server's and the relay's quota.
 	r := reservation("m_1", "h_1", "", t0)
@@ -249,7 +249,7 @@ func TestReserveClientID(t *testing.T) {
 	s := open(t)
 	ctx := context.Background()
 	_ = s.CreateInstance(ctx, inst("inst_a", "a@x.org"), 2)
-	_, _ = s.UpsertHandle(ctx, "h_1", "inst_a", "ios", "tok", []byte("s"), t0)
+	_, _ = s.UpsertHandle(ctx, "h_1", "inst_a", "ios", "tok", "sandbox", []byte("s"), t0)
 	if o, _, _ := s.Reserve(ctx, reservation("m_1", "h_1", "n1", t0)); o != Reserved {
 		t.Fatalf("%v", o)
 	}
@@ -306,8 +306,8 @@ func TestRevokeHandleTokenNeedsTheSameToken(t *testing.T) {
 	s := open(t)
 	ctx := context.Background()
 	_ = s.CreateInstance(ctx, inst("inst_a", "a@x.org"), 2)
-	_, _ = s.UpsertHandle(ctx, "h_1", "inst_a", "ios", "tok-a", []byte("s"), t0)
-	_ = s.RefreshHandleToken(ctx, "h_1", "inst_a", "tok-b", t0)
+	_, _ = s.UpsertHandle(ctx, "h_1", "inst_a", "ios", "tok-a", "sandbox", []byte("s"), t0)
+	_ = s.RefreshHandleToken(ctx, "h_1", "inst_a", "tok-b", "production", t0)
 	if err := s.RevokeHandleToken(ctx, "h_1", "tok-a", t0); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("old token revoked: %v", err)
 	}
@@ -320,7 +320,7 @@ func TestStalePendingSendsAreReleased(t *testing.T) {
 	s := open(t)
 	ctx := context.Background()
 	_ = s.CreateInstance(ctx, inst("inst_a", "a@x.org"), 2)
-	_, _ = s.UpsertHandle(ctx, "h_1", "inst_a", "ios", "tok", []byte("s"), t0)
+	_, _ = s.UpsertHandle(ctx, "h_1", "inst_a", "ios", "tok", "sandbox", []byte("s"), t0)
 	r := reservation("m_1", "h_1", "", t0)
 	r.HandlePerDay = 1
 	if o, _, _ := s.Reserve(ctx, r); o != Reserved {
@@ -351,5 +351,105 @@ func TestStalePendingSendsAreReleased(t *testing.T) {
 	r.MessageID, r.At = "m_3", t0.Add(time.Hour+PendingTimeout+time.Second)
 	if o, _, _ := s.Reserve(ctx, r); o != Reserved {
 		t.Fatalf("the device's quota is still held by a stale send: %v", o)
+	}
+}
+
+func TestHandleKeepsItsAPNsEnvironment(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	_ = s.CreateInstance(ctx, inst("inst_a", "a@x.org"), 2)
+	if _, err := s.UpsertHandle(ctx, "h_1", "inst_a", "ios", "aa", "sandbox", []byte("s"), t0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RefreshHandleToken(ctx, "h_1", "inst_a", "bb", "production", t0); err != nil {
+		t.Fatal(err)
+	}
+	if h, _ := s.Handle(ctx, "h_1"); h.Token != "bb" || h.APNsEnv != "production" || h.Platform != "ios" {
+		t.Fatalf("%+v", h)
+	}
+	if _, err := s.UpsertHandle(ctx, "h_2", "inst_a", "android", "cc", "", []byte("s"), t0); err != nil {
+		t.Fatal(err)
+	}
+	if h, _ := s.Handle(ctx, "h_2"); h.APNsEnv != "" {
+		t.Fatalf("%+v", h)
+	}
+	// The schema refuses an environment that does not fit the platform.
+	for _, c := range []struct{ platform, env string }{{"ios", ""}, {"ios", "staging"}, {"android", "sandbox"}} {
+		if _, err := s.UpsertHandle(ctx, "h_x", "inst_a", c.platform, "dd", c.env, []byte("s"), t0); err == nil {
+			t.Errorf("%s with %q stored", c.platform, c.env)
+		}
+	}
+}
+
+func TestMigrationKeepsHandles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	ctx := context.Background()
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Roll the schema back to the last version with fcm_token, as a database from before APNs would be.
+	db := s.DB()
+	for _, q := range []string{
+		`DROP TABLE handles`,
+		`CREATE TABLE handles (
+			handle TEXT PRIMARY KEY,
+			secret_hash BLOB NOT NULL,
+			instance_id TEXT NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+			platform TEXT NOT NULL CHECK (platform IN ('ios', 'android')),
+			fcm_token TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			refreshed_at INTEGER NOT NULL,
+			last_sent_at INTEGER NOT NULL DEFAULT 0,
+			revoked_at INTEGER NOT NULL DEFAULT 0,
+			UNIQUE (instance_id, fcm_token)
+		)`,
+		`PRAGMA user_version = 3`,
+	} {
+		if _, err := db.ExecContext(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.CreateInstance(ctx, inst("inst_a", "a@x.org"), 2); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range []struct {
+		handle, platform, token string
+		revoked                 int64
+	}{{"h_a", "android", "fcm-a", 0}, {"h_i", "ios", "fcm-i", 0}, {"h_r", "android", "fcm-r", 7}} {
+		if _, err := db.ExecContext(ctx, `INSERT INTO handles (handle, secret_hash, instance_id, platform, fcm_token, created_at,
+			refreshed_at, last_sent_at, revoked_at) VALUES (?, ?, 'inst_a', ?, ?, 1, 2, 3, ?)`,
+			r.handle, []byte("s-"+r.handle), r.platform, r.token, r.revoked); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.Close()
+
+	s, err = Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	a, err := s.Handle(ctx, "h_a")
+	if err != nil || a.Token != "fcm-a" || a.APNsEnv != "" || string(a.SecretHash) != "s-h_a" || a.CreatedAt != 1 ||
+		a.RefreshedAt != 2 || a.LastSentAt != 3 || a.RevokedAt != 0 {
+		t.Fatalf("%+v %v", a, err)
+	}
+	if r, _ := s.Handle(ctx, "h_r"); r.RevokedAt != 7 || r.Token != "fcm-r" {
+		t.Fatalf("%+v", r)
+	}
+	// A live iOS handle held an FCM token: it is kept but revoked, so the app registers again.
+	if i, _ := s.Handle(ctx, "h_i"); i.RevokedAt == 0 || i.Token != "fcm-i" || i.Platform != "ios" {
+		t.Fatalf("%+v", i)
+	}
+	// The unique pair and the cascade survived the rebuild.
+	if h, _ := s.UpsertHandle(ctx, "h_b", "inst_a", "android", "fcm-a", "", []byte("s"), t0); h != "h_a" {
+		t.Fatalf("same token got %q", h)
+	}
+	if _, err := s.DB().ExecContext(ctx, `DELETE FROM instances WHERE id = 'inst_a'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Handle(ctx, "h_a"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("handles outlived their server: %v", err)
 	}
 }

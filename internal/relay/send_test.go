@@ -365,7 +365,7 @@ func TestStaleUnregisteredKeepsARefreshedHandle(t *testing.T) {
 	dev := h.handle(id, "tok-a").Handle
 	h.push.set(func(f *fakePush) {
 		f.hook = func(m push.Message) error {
-			if err := h.store.RefreshHandleToken(ctx, dev, id, "tok-b", h.clock.now()); err != nil {
+			if err := h.store.RefreshHandleToken(ctx, dev, id, "tok-b", "", h.clock.now()); err != nil {
 				t.Error(err)
 			}
 			return push.ErrUnregistered
@@ -374,7 +374,7 @@ func TestStaleUnregisteredKeepsARefreshedHandle(t *testing.T) {
 	if res, _ := h.send(auth, items(dev)...); res[0].Status != StatusFailed {
 		t.Fatalf("%+v", res)
 	}
-	if hd, _ := h.store.Handle(ctx, dev); hd.RevokedAt != 0 || hd.FCMToken != "tok-b" {
+	if hd, _ := h.store.Handle(ctx, dev); hd.RevokedAt != 0 || hd.Token != "tok-b" {
 		t.Fatalf("refreshed handle revoked: %+v", hd)
 	}
 }
@@ -687,5 +687,117 @@ func TestFCMThrottleKeepsALongWait(t *testing.T) {
 	}
 	if d := h.relay.cooledFor(dev, h.clock.now()); d != 2*time.Hour {
 		t.Fatalf("cooldown %s", d)
+	}
+}
+
+var apnsToken = strings.Repeat("ab", 32)
+
+func (h *harness) iosHandle(pushID, token, env string) HandleResponse {
+	h.t.Helper()
+	var out HandleResponse
+	if resp := h.api("POST", "/v1/handles", "", HandleRequest{PushID: pushID, Platform: "ios", Token: token, APNSEnvironment: env}, &out); resp.StatusCode != 200 {
+		h.t.Fatalf("ios handle: %d", resp.StatusCode)
+	}
+	return out
+}
+
+func TestIOSHandleNeedsAnAPNsTokenAndEnvironment(t *testing.T) {
+	h := newHarness(t)
+	id, auth := h.register("A", "a@example.org", "")
+	for _, c := range []struct {
+		platform, token, env, code string
+	}{
+		{"ios", apnsToken, "", "bad_apns_environment"},
+		{"ios", apnsToken, "staging", "bad_apns_environment"},
+		{"android", "fcm-tok", "sandbox", "bad_apns_environment"},
+		{"ios", "fcm-tok:APA91b", "sandbox", "bad_token"},
+		{"ios", strings.Repeat("a", 62), "sandbox", "bad_token"},
+		{"ios", strings.Repeat("a", 65), "sandbox", "bad_token"},
+		{"ios", strings.Repeat("a", 202), "sandbox", "bad_token"},
+		{"ios", strings.Repeat("g", 64), "sandbox", "bad_token"},
+		{"android", "", "", "bad_token"},
+	} {
+		var e apiError
+		resp := h.api("POST", "/v1/handles", "", HandleRequest{PushID: id, Platform: c.platform, Token: c.token, APNSEnvironment: c.env}, &e)
+		if resp.StatusCode != 400 || e.Error.Code != c.code {
+			t.Errorf("%s %q %q: %d %s", c.platform, c.token, c.env, resp.StatusCode, e.Error.Code)
+		}
+	}
+
+	// Upper-case hex is stored lower-case, and the message carries the environment.
+	dev := h.iosHandle(id, strings.ToUpper(apnsToken), "sandbox")
+	again := h.iosHandle(id, apnsToken, "sandbox")
+	if again.Handle != dev.Handle {
+		t.Fatal("the same token in another case got a new handle")
+	}
+	dev = again
+	h.send(auth, items(dev.Handle)...)
+	if sent := h.push.messages(); len(sent) != 1 || sent[0].Platform != "ios" || sent[0].Token != apnsToken || sent[0].APNsEnv != "sandbox" {
+		t.Fatalf("%+v", sent)
+	}
+
+	// A refresh can move the token and the environment, and is checked against the handle's platform.
+	path := "/v1/handles/" + dev.Handle
+	var e apiError
+	if resp := h.api("PUT", path, "", HandleUpdate{HandleSecret: dev.HandleSecret, Token: "fcm-tok"}, &e); resp.StatusCode != 400 ||
+		e.Error.Code != "bad_apns_environment" {
+		t.Fatalf("refresh without environment: %d %s", resp.StatusCode, e.Error.Code)
+	}
+	newToken := strings.Repeat("cd", 40)
+	if resp := h.api("PUT", path, "", HandleUpdate{HandleSecret: dev.HandleSecret, Token: newToken, APNSEnvironment: "production"}, nil); resp.StatusCode != 204 {
+		t.Fatalf("refresh: %d", resp.StatusCode)
+	}
+	if hd, _ := h.store.Handle(context.Background(), dev.Handle); hd.Token != newToken || hd.APNsEnv != "production" {
+		t.Fatalf("%+v", hd)
+	}
+	android := h.handle(id, "fcm-tok")
+	if resp := h.api("PUT", "/v1/handles/"+android.Handle, "", HandleUpdate{HandleSecret: android.HandleSecret, Token: "fcm-tok-2",
+		APNSEnvironment: "sandbox"}, &e); resp.StatusCode != 400 || e.Error.Code != "bad_apns_environment" {
+		t.Fatalf("android refresh with environment: %d %s", resp.StatusCode, e.Error.Code)
+	}
+}
+
+func TestOneProviderOutageLeavesTheOtherSending(t *testing.T) {
+	h := newHarness(t)
+	id, auth := h.register("A", "a@example.org", "")
+	devs := h.devices(id, 2)
+	phone := h.iosHandle(id, apnsToken, "production").Handle
+	h.relay.sendWorkers = 1
+	h.push.set(func(f *fakePush) {
+		f.errs["tok-0"] = &push.Error{Provider: push.FCM, Status: 503, RetryAfter: 120 * time.Second, Kind: push.ErrUnavailable}
+	})
+	res, _ := h.send(auth, items(devs[0], devs[1], phone)...)
+	if res[0].Status != StatusFailed || res[1].Status != StatusRateLimited || res[2].Status != StatusOK {
+		t.Fatalf("an FCM outage held back iOS: %+v", res)
+	}
+	if d := h.relay.pausedFor(push.APNs, h.clock.now()); d > 0 {
+		t.Fatalf("APNs paused for %s", d)
+	}
+
+	// And the other way round.
+	h.clock.add(121 * time.Second)
+	h.push.set(func(f *fakePush) {
+		delete(f.errs, "tok-0")
+		f.errs[apnsToken] = &push.Error{Provider: push.APNs, Status: 503, Kind: push.ErrUnavailable}
+	})
+	res, _ = h.send(auth, items(phone, devs[0])...)
+	if res[0].Status != StatusFailed || res[0].RetryAfterSeconds != 60 || res[1].Status != StatusOK {
+		t.Fatalf("an APNs outage held back Android: %+v", res)
+	}
+	if res, _ := h.send(auth, items(phone)...); res[0].Status != StatusRateLimited {
+		t.Fatalf("APNs not paused: %+v", res)
+	}
+}
+
+func TestTooLargeForTheProviderIsTooLarge(t *testing.T) {
+	h := newHarness(t)
+	id, auth := h.register("A", "a@example.org", "")
+	phone := h.iosHandle(id, apnsToken, "sandbox").Handle
+	h.push.set(func(f *fakePush) { f.errs[apnsToken] = push.ErrTooLarge })
+	if res, _ := h.send(auth, items(phone)...); res[0].Status != StatusTooLarge {
+		t.Fatalf("%+v", res)
+	}
+	if n, _ := h.store.SentToday(context.Background(), id, h.clock.now()); n != 0 {
+		t.Fatalf("a refused send counted: %d", n)
 	}
 }

@@ -366,7 +366,7 @@ func (s *Server) sendOne(ctx context.Context, b *batch, j sendJob) SendResult {
 	// Not cancelled with the request, which would leave the outcome unknown, but bounded as a whole.
 	sctx, scancel := context.WithTimeout(b.db, s.sendLimit)
 	err = s.push.Send(sctx, push.Message{
-		Platform: h.Platform, Token: h.FCMToken,
+		Platform: h.Platform, Token: h.Token, APNsEnv: h.APNsEnv,
 		Data: map[string]string{"v": "1", "pushId": inst.ID, "serverName": inst.Name, "messageId": msgID,
 			"ct": base64.StdEncoding.EncodeToString(j.ct)},
 		CollapseKey: collapse, TTL: ttl, AlertTitle: inst.Name, AlertBody: "New alert",
@@ -441,11 +441,11 @@ func (s *Server) finishSend(b *batch, msgID string, ok bool) error {
 
 // unregistered revokes a handle its provider no longer knows, unless the app moved it to a new token meanwhile.
 func (s *Server) unregistered(ctx context.Context, b *batch, h store.Handle) SendResult {
-	err := s.store.RevokeHandleToken(ctx, h.Handle, h.FCMToken, s.now())
+	err := s.store.RevokeHandleToken(ctx, h.Handle, h.Token, s.now())
 	if errors.Is(err, store.ErrNotFound) {
 		cur, cerr := s.store.Handle(ctx, h.Handle)
 		switch {
-		case errors.Is(cerr, store.ErrNotFound), cerr == nil && cur.RevokedAt != 0 && cur.FCMToken == h.FCMToken:
+		case errors.Is(cerr, store.ErrNotFound), cerr == nil && cur.RevokedAt != 0 && cur.Token == h.Token:
 			err = nil // already gone for this token
 		case cerr == nil:
 			return SendResult{Status: StatusFailed} // a fresh token: retry reaches it

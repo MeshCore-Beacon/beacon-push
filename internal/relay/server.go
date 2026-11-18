@@ -86,6 +86,7 @@ type Server struct {
 	minute, hour *limit.Window
 	harvest      harvestCounter
 	checking     sync.Map // server ID -> struct{}, a domain check in flight
+	sending      sync.Map // server ID -> *sync.Mutex, held for one send batch
 	reviewed     sync.Map // server ID -> struct{}, the device-count review notice was sent
 }
 
@@ -142,11 +143,20 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-// clientIP is the caller's address: behind Caddy the last X-Forwarded-For entry, which Caddy appended itself.
+// lockInstance serialises send batches per server and returns the unlock.
+func (s *Server) lockInstance(id string) func() {
+	m, _ := s.sending.LoadOrStore(id, &sync.Mutex{})
+	mu := m.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+// clientIP is the caller's address: behind Caddy the last X-Forwarded-For entry across every header line, which is
+// the one Caddy wrote. Entries a client sent itself come before it.
 func (s *Server) clientIP(r *http.Request) string {
 	if s.cfg.TrustProxy {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			parts := strings.Split(xff, ",")
+		if values := r.Header.Values("X-Forwarded-For"); len(values) > 0 {
+			parts := strings.Split(strings.Join(values, ","), ",")
 			if ip := net.ParseIP(strings.TrimSpace(parts[len(parts)-1])); ip != nil {
 				return ip.String()
 			}
@@ -310,8 +320,8 @@ func (s *Server) notifyAdmin(ctx context.Context, subject, text string) {
 
 // ── Harvesting detection ────────────────────────────────────────────────────────────────────────
 
-// harvestCounter counts, per server and hour, the handles it addressed and how many were not its own or did not
-// exist: a server trying handles it harvested elsewhere.
+// harvestCounter counts, per server and hour, the handles it addressed and how many belong to another server: a
+// server trying handles it harvested elsewhere.
 type harvestCounter struct {
 	mu sync.Mutex
 	m  map[string]*harvestSlot

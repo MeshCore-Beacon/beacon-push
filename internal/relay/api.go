@@ -128,6 +128,9 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, inst store.Instanc
 		return
 	}
 	ctx := r.Context()
+	// One batch per server at a time, so concurrent requests cannot each pass the daily check on the same count.
+	unlock := s.lockInstance(inst.ID)
+	defer unlock()
 	now := s.now()
 	tier := TierFor(inst)
 	sentToday, err := s.store.SentToday(ctx, inst.ID, now)
@@ -171,13 +174,16 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, inst store.Instanc
 			s.internal(w, "handle lookup failed", err)
 			return
 		}
-		foreign := errors.Is(err, store.ErrNotFound) || h.InstanceID != inst.ID
-		if s.harvest.add(inst.ID, foreign, now) {
+		missing := errors.Is(err, store.ErrNotFound)
+		// Only another server's live handle proves harvesting. A missing one may simply have been purged, and a
+		// guessed one reaches nobody.
+		stolen := !missing && h.InstanceID != inst.ID
+		if s.harvest.add(inst.ID, stolen, now) {
 			s.suspendForHarvesting(ctx, inst)
 			writeError(w, http.StatusForbidden, "suspended", "This server is suspended from the push relay. Contact abuse@meshcorebeacon.ca.")
 			return
 		}
-		if foreign || h.RevokedAt != 0 {
+		if missing || stolen || h.RevokedAt != 0 {
 			results[i].Status = StatusInvalidHandle
 			if err := s.store.BumpUsage(ctx, inst.ID, now, store.UsageInvalidHandle); err != nil {
 				s.log.Warn("usage not counted", "component", "relay", "push_id", inst.ID, "err", err)

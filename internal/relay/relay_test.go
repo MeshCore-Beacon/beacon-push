@@ -258,6 +258,8 @@ func TestRegistrationRules(t *testing.T) {
 		"bad email":  registration("X", "x at example", ""),
 		"long name":  registration(strings.Repeat("n", 41), "x@example.org", ""),
 		"angle name": registration("<b>", "x@example.org", ""),
+		"bidi name":  registration("Ottawa\u202eMesh", "x@example.org", ""),
+		"zwj name":   registration("Otta\u200dwa", "x@example.org", ""),
 		"http url":   registration("X", "x@example.org", "ftp://example.org"),
 	} {
 		if code, body := h.form("/register", h.nextIP(), v); code != 400 || !strings.Contains(body, `class="error"`) {
@@ -461,10 +463,26 @@ func TestSuspendAndBan(t *testing.T) {
 
 func TestHarvestingSuspends(t *testing.T) {
 	h := newHarness(t)
+	victimID, _ := h.register("Victim", "v@example.org", "")
 	id, auth := h.register("A", "a@example.org", "")
+
+	// Handles that do not exist are only refused: they may have been purged, and they reach nobody.
+	unknown := make([]SendItem, MaxBatch)
+	for i := range unknown {
+		unknown[i] = SendItem{Handle: fmt.Sprintf("h_gone%d", i), Ciphertext: ct}
+	}
+	if res, resp := h.send(auth, unknown...); resp.StatusCode != 200 || res[0].Status != StatusInvalidHandle {
+		t.Fatalf("unknown handles: %d %+v", resp.StatusCode, res)
+	}
+	if inst, _ := h.store.Instance(context.Background(), id); inst.Status != store.StatusActive {
+		t.Fatalf("suspended for unknown handles: %s", inst.Status)
+	}
+
+	// Another server's live handles are harvesting.
+	h.clock.add(time.Hour)
 	items := make([]SendItem, MaxBatch)
 	for i := range items {
-		items[i] = SendItem{Handle: fmt.Sprintf("h_stolen%d", i), Ciphertext: ct}
+		items[i] = SendItem{Handle: h.handle(victimID, fmt.Sprintf("victim-tok-%d", i)).Handle, Ciphertext: ct}
 	}
 	if _, resp := h.send(auth, items...); resp.StatusCode != 403 {
 		t.Fatalf("harvesting batch: %d", resp.StatusCode)
@@ -558,5 +576,44 @@ func TestPages(t *testing.T) {
 		if !strings.Contains(resp.Header.Get("Content-Security-Policy"), "default-src 'none'") {
 			t.Errorf("%s: no CSP", p)
 		}
+	}
+}
+
+func TestConcurrentBatchesKeepTheDailyQuota(t *testing.T) {
+	h := newHarness(t)
+	id, auth := h.register("A", "a@example.org", "")
+	if err := h.store.SetQuota(context.Background(), id, 1000, 5); err != nil {
+		t.Fatal(err)
+	}
+	devs := make([]HandleResponse, 8)
+	for i := range devs {
+		devs[i] = h.handle(id, fmt.Sprintf("tok-%d", i))
+	}
+	var wg sync.WaitGroup
+	for _, d := range devs {
+		wg.Add(1)
+		go func(handle string) {
+			defer wg.Done()
+			h.send(auth, SendItem{Handle: handle, Ciphertext: ct}, SendItem{Handle: handle, Ciphertext: ct})
+		}(d.Handle)
+	}
+	wg.Wait()
+	if n := len(h.push.messages()); n != 5 {
+		t.Fatalf("sent %d, the daily quota is 5", n)
+	}
+}
+
+func TestClientIPTakesTheProxysEntry(t *testing.T) {
+	s := New(Options{Config: config.Config{TrustProxy: true}})
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "10.0.0.2:4000"
+	r.Header.Add("X-Forwarded-For", "1.1.1.1")
+	r.Header.Add("X-Forwarded-For", "9.9.9.9, 203.0.113.5")
+	if ip := s.clientIP(r); ip != "203.0.113.5" {
+		t.Fatalf("%s", ip)
+	}
+	s = New(Options{Config: config.Config{}})
+	if ip := s.clientIP(r); ip != "10.0.0.2" {
+		t.Fatalf("without TrustProxy: %s", ip)
 	}
 }

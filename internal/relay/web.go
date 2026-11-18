@@ -69,14 +69,16 @@ func (s *Server) registerForm(w http.ResponseWriter, _ *http.Request) {
 	s.render(w, http.StatusOK, "register", pageData{})
 }
 
-// cleanName is the display name shown on notifications: 1 to 40 characters, no control characters, spaces collapsed.
+// cleanName is the display name shown on notifications: 1 to 40 printable characters, spaces collapsed. Format
+// characters (bidi overrides, zero-width joiners and the like) are refused, so one name cannot be made to look like
+// another.
 func cleanName(raw string) (string, bool) {
 	name := strings.Join(strings.FieldsFunc(raw, unicode.IsSpace), " ")
 	if name == "" || utf8.RuneCountInString(name) > 40 {
 		return "", false
 	}
 	for _, r := range name {
-		if unicode.IsControl(r) || r == '<' || r == '>' {
+		if !unicode.IsPrint(r) || r == '<' || r == '>' {
 			return "", false
 		}
 	}

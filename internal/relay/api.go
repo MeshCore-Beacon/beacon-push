@@ -161,7 +161,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, inst store.Instanc
 		ct, err := base64.StdEncoding.DecodeString(item.Ciphertext)
 		switch {
 		case err != nil || len(ct) == 0 || !validCollapseKey(item.CollapseKey) || item.TTLSeconds < 0 ||
-			time.Duration(item.TTLSeconds)*time.Second > MaxTTL:
+			int64(item.TTLSeconds) > int64(MaxTTL/time.Second): // compare seconds, a Duration product can overflow
 			results[i].Status = StatusInvalid
 			continue
 		case len(ct) > MaxCiphertext:
@@ -177,7 +177,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, inst store.Instanc
 		missing := errors.Is(err, store.ErrNotFound)
 		// Only another server's live handle proves harvesting. A missing one may simply have been purged, and a
 		// guessed one reaches nobody.
-		stolen := !missing && h.InstanceID != inst.ID
+		stolen := !missing && h.InstanceID != inst.ID && h.RevokedAt == 0
 		if s.harvest.add(inst.ID, stolen, now) {
 			s.suspendForHarvesting(ctx, inst)
 			writeError(w, http.StatusForbidden, "suspended", "This server is suspended from the push relay. Contact abuse@meshcorebeacon.ca.")

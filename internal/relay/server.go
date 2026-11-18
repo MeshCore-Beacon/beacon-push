@@ -49,7 +49,7 @@ const (
 	DomainChecksPerHour   = 10 // per server, on request
 	HandleReviewThreshold = 1000
 
-	MaxBody           = 256 << 10
+	MaxBody           = 512 << 10 // 100 maximum-size items with room for JSON
 	MaxBatch          = 100
 	MaxCiphertext     = 2048
 	MaxCollapseKey    = 40

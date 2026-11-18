@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -69,7 +70,7 @@ type harness struct {
 	push  *fakePush
 	mail  *mail.Recorder
 	clock *clock
-	ip    int
+	ip    atomic.Int64
 }
 
 func newHarness(t *testing.T) *harness {
@@ -91,8 +92,7 @@ func newHarness(t *testing.T) *harness {
 
 // nextIP gives each request its own client address, so per-IP limits only bite where a test means them to.
 func (h *harness) nextIP() string {
-	h.ip++
-	return fmt.Sprintf("203.0.113.%d", h.ip%250+1)
+	return fmt.Sprintf("203.0.113.%d", h.ip.Add(1)%250+1)
 }
 
 func (h *harness) form(path, ip string, v url.Values) (int, string) {

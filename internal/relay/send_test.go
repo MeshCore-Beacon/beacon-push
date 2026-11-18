@@ -624,6 +624,15 @@ func TestWorkerPanicFailsOnlyThatItem(t *testing.T) {
 	if resp.StatusCode != 200 || res[0].Status != StatusFailed || res[1].Status != StatusOK {
 		t.Fatalf("%d %+v", resp.StatusCode, res)
 	}
+	// The panicked send's reservation is given back once it is older than the pending timeout.
+	if err := h.store.SetQuota(context.Background(), id, 10_000, 2); err != nil {
+		t.Fatal(err)
+	}
+	h.push.set(func(f *fakePush) { f.hook = nil })
+	h.clock.add(store.PendingTimeout + time.Second)
+	if res, _ := h.send(auth, items(devs[1])...); res[0].Status != StatusOK {
+		t.Fatalf("quota still held by the abandoned send: %+v", res)
+	}
 }
 
 func TestDuplicateIDInABatchSpendsNoLimit(t *testing.T) {

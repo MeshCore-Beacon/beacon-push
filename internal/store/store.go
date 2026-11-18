@@ -97,6 +97,8 @@ var migrations = []string{
 	// client_id is the sender's idempotency key; status is pending until FCM answers, then ok or failed.
 	`ALTER TABLE send_log ADD COLUMN client_id TEXT;
 	CREATE UNIQUE INDEX idx_send_log_client ON send_log (instance_id, client_id) WHERE client_id IS NOT NULL;`,
+	// Keeps the search for abandoned pending sends cheap enough to run on every reservation.
+	`CREATE INDEX idx_send_log_pending ON send_log (at) WHERE status = 'pending';`,
 }
 
 // Open opens (creating if needed) the database at path and brings its schema up to date.
@@ -485,6 +487,9 @@ func (s *Store) Reserve(ctx context.Context, r Reservation) (Outcome, string, er
 	if inst.Status != StatusActive {
 		return NotActive, "", nil
 	}
+	if err := releaseStale(ctx, tx, r.At); err != nil {
+		return 0, "", err
+	}
 	dayCap := r.InstancePerDay
 	if r.DayLimit != nil {
 		dayCap = r.DayLimit(inst)
@@ -591,6 +596,35 @@ func release(ctx context.Context, tx *sql.Tx, messageID string) error {
 	return err
 }
 
+// releaseStale gives back the quota of pending sends older than PendingTimeout, whose outcome is unknown (the relay
+// stopped or a send panicked). Their ids, if any, can be sent again.
+func releaseStale(ctx context.Context, tx *sql.Tx, now time.Time) error {
+	rows, err := tx.QueryContext(ctx, `SELECT message_id FROM send_log WHERE status = 'pending' AND at < ?`,
+		Ms(now.Add(-PendingTimeout)))
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err := release(ctx, tx, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // SentByClientID is the status and message ID of the send a client ID last named, or ErrNotFound. A cheap look
 // before rate limits are spent; Reserve decides for real.
 func (s *Store) SentByClientID(ctx context.Context, instanceID, clientID string) (status, messageID string, at time.Time, err error) {
@@ -676,8 +710,19 @@ const (
 	TokenKeep         = 24 * time.Hour // after expiry
 )
 
-// Cleanup deletes what has outlived its retention period.
+// Cleanup deletes what has outlived its retention period and releases abandoned pending sends.
 func (s *Store) Cleanup(ctx context.Context, now time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := releaseStale(ctx, tx, now); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
 	for _, q := range []struct {
 		sql string
 		arg any

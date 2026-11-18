@@ -83,8 +83,8 @@ Authenticate with `Authorization: Bearer <push id>.<push secret>`.
   was sent answers `ok` with the earlier `messageId` and sends and counts
   nothing, even if the handle has gone or the relay is paused since. Repeating an id whose send is still under way, or whose outcome
   is unknown because the relay stopped mid-send, answers `rate_limited` with
-  `retryAfterSeconds: 30`; after 2 minutes such a send counts as failed and
-  the next repeat sends again. Repeating an id whose send failed sends again.
+  `retryAfterSeconds: 30`; after 2 minutes such a send counts as failed, its
+  quota is given back (with or without an id) and the next repeat sends again. Repeating an id whose send failed sends again.
   beacon-server uses `<outbox row id>:<device session uuid>`.
 
 The relay sends up to 8 messages of a batch at once and starts no new one

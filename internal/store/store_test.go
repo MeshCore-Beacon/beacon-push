@@ -315,3 +315,41 @@ func TestRevokeHandleTokenNeedsTheSameToken(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestStalePendingSendsAreReleased(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	_ = s.CreateInstance(ctx, inst("inst_a", "a@x.org"), 2)
+	_, _ = s.UpsertHandle(ctx, "h_1", "inst_a", "ios", "tok", []byte("s"), t0)
+	r := reservation("m_1", "h_1", "", t0)
+	r.HandlePerDay = 1
+	if o, _, _ := s.Reserve(ctx, r); o != Reserved {
+		t.Fatalf("%v", o)
+	}
+	if err := s.Cleanup(ctx, t0.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := s.SentToday(ctx, "inst_a", t0); n != 1 {
+		t.Fatalf("a fresh pending send was released: %d", n)
+	}
+	if err := s.Cleanup(ctx, t0.Add(PendingTimeout+time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := s.SentToday(ctx, "inst_a", t0); n != 0 {
+		t.Fatalf("stale pending send still counted: %d", n)
+	}
+	var status string
+	_ = s.db.QueryRow(`SELECT status FROM send_log WHERE message_id = 'm_1'`).Scan(&status)
+	if status != SendFailed {
+		t.Fatalf("status %q", status)
+	}
+	// Reserve releases them too, without waiting for cleanup.
+	r.MessageID, r.At = "m_2", t0.Add(time.Hour)
+	if o, _, _ := s.Reserve(ctx, r); o != Reserved {
+		t.Fatalf("%v", o)
+	}
+	r.MessageID, r.At = "m_3", t0.Add(time.Hour+PendingTimeout+time.Second)
+	if o, _, _ := s.Reserve(ctx, r); o != Reserved {
+		t.Fatalf("the device's quota is still held by a stale send: %v", o)
+	}
+}

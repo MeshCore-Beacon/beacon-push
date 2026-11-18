@@ -134,8 +134,11 @@ func TestUsageAndCleanup(t *testing.T) {
 	_ = s.CreateInstance(ctx, inst("inst_a", "a@x.org"), 2)
 	_, _ = s.UpsertHandle(ctx, "h_1", "inst_a", "ios", "tok", []byte("s"), t0)
 	for i, at := range []time.Time{t0.Add(-40 * 24 * time.Hour), t0} {
-		if err := s.RecordSend(ctx, Send{MessageID: "m_" + string(rune('a'+i)), InstanceID: "inst_a", Handle: "h_1", Status: "ok", At: at,
-			Size: 10, CiphertextSHA256: []byte("x")}); err != nil {
+		id := "m_" + string(rune('a'+i))
+		if o, _, err := s.Reserve(ctx, reservation(id, "h_1", "", at)); err != nil || o != Reserved {
+			t.Fatal(o, err)
+		}
+		if err := s.FinishSend(ctx, id, true, at); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -187,5 +190,128 @@ func TestDomainCheckState(t *testing.T) {
 	_ = s.SetDomainCheck(ctx, "inst_a", false, t0.Add(2*time.Hour))
 	if got, _ := s.Instance(ctx, "inst_a"); got.DomainVerifiedAt != 0 {
 		t.Fatal("failure must clear verification")
+	}
+}
+
+func reservation(msgID, handle, clientID string, at time.Time) Reservation {
+	return Reservation{MessageID: msgID, InstanceID: "inst_a", Handle: handle, ClientID: clientID, At: at, Size: 10,
+		CiphertextSHA256: []byte("x"), InstancePerDay: 100, GlobalPerDay: 100, HandlePerDay: 100}
+}
+
+func TestReserveCountsPendingSends(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	_ = s.CreateInstance(ctx, inst("inst_a", "a@x.org"), 2)
+	_ = s.CreateInstance(ctx, inst("inst_b", "b@x.org"), 2)
+	_, _ = s.UpsertHandle(ctx, "h_1", "inst_a", "ios", "tok", []byte("s"), t0)
+
+	// A pending send already holds the device's, the server's and the relay's quota.
+	r := reservation("m_1", "h_1", "", t0)
+	r.HandlePerDay = 1
+	if o, _, _ := s.Reserve(ctx, r); o != Reserved {
+		t.Fatalf("first: %v", o)
+	}
+	r.MessageID = "m_2"
+	if o, _, _ := s.Reserve(ctx, r); o != OverHandleDay {
+		t.Fatalf("device cap with a pending send: %v", o)
+	}
+	r.HandlePerDay, r.InstancePerDay = 100, 1
+	if o, _, _ := s.Reserve(ctx, r); o != OverInstanceDay {
+		t.Fatalf("server cap: %v", o)
+	}
+	r.InstancePerDay, r.GlobalPerDay = 100, 1
+	if o, _, _ := s.Reserve(ctx, r); o != OverGlobalDay {
+		t.Fatalf("global cap: %v", o)
+	}
+	// A failed send gives its quota back.
+	if err := s.FinishSend(ctx, "m_1", false, t0); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := s.SentToday(ctx, "inst_a", t0); n != 0 {
+		t.Fatalf("released send still counted: %d", n)
+	}
+	if n, _ := s.HandleSentSince(ctx, "h_1", t0.Add(-time.Hour)); n != 0 {
+		t.Fatalf("failed send counted for the device: %d", n)
+	}
+	if o, _, _ := s.Reserve(ctx, r); o != Reserved {
+		t.Fatalf("after release: %v", o)
+	}
+	if err := s.SetStatus(ctx, "inst_a", StatusSuspended, nil, t0); err != nil {
+		t.Fatal(err)
+	}
+	r.MessageID, r.GlobalPerDay = "m_3", 100
+	if o, _, _ := s.Reserve(ctx, r); o != NotActive {
+		t.Fatalf("suspended server reserved: %v", o)
+	}
+}
+
+func TestReserveClientID(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	_ = s.CreateInstance(ctx, inst("inst_a", "a@x.org"), 2)
+	_, _ = s.UpsertHandle(ctx, "h_1", "inst_a", "ios", "tok", []byte("s"), t0)
+	if o, _, _ := s.Reserve(ctx, reservation("m_1", "h_1", "n1", t0)); o != Reserved {
+		t.Fatalf("%v", o)
+	}
+	if o, _, _ := s.Reserve(ctx, reservation("m_2", "h_1", "n1", t0.Add(time.Minute))); o != InFlight {
+		t.Fatalf("in flight: %v", o)
+	}
+	// An abandoned reservation counts as failed after the timeout and gives its quota back.
+	if o, id, _ := s.Reserve(ctx, reservation("m_3", "h_1", "n1", t0.Add(PendingTimeout+time.Second))); o != Reserved || id != "m_3" {
+		t.Fatalf("stale: %v %s", o, id)
+	}
+	if n, _ := s.SentToday(ctx, "inst_a", t0); n != 1 {
+		t.Fatalf("stale reservation still counted: %d", n)
+	}
+	if err := s.FinishSend(ctx, "m_3", true, t0); err != nil {
+		t.Fatal(err)
+	}
+	if o, id, _ := s.Reserve(ctx, reservation("m_4", "h_1", "n1", t0.Add(time.Hour))); o != AlreadySent || id != "m_3" {
+		t.Fatalf("repeat of a sent id: %v %s", o, id)
+	}
+	if o, _, _ := s.Reserve(ctx, reservation("m_5", "h_1", "n2", t0)); o != Reserved {
+		t.Fatalf("%v", o)
+	}
+	_ = s.FinishSend(ctx, "m_5", false, t0)
+	if o, _, _ := s.Reserve(ctx, reservation("m_6", "h_1", "n2", t0)); o != Reserved {
+		t.Fatalf("repeat of a failed id: %v", o)
+	}
+	// Another server may use the same id.
+	_ = s.CreateInstance(ctx, inst("inst_b", "b@x.org"), 2)
+	r := reservation("m_7", "h_1", "n1", t0)
+	r.InstanceID = "inst_b"
+	if o, _, _ := s.Reserve(ctx, r); o != Reserved {
+		t.Fatalf("other server: %v", o)
+	}
+}
+
+func TestSuspendIfActiveKeepsABan(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	_ = s.CreateInstance(ctx, inst("inst_a", "a@x.org"), 2)
+	_ = s.SetStatus(ctx, "inst_a", StatusBanned, nil, t0)
+	if done, err := s.SuspendIfActive(ctx, "inst_a"); done || err != nil {
+		t.Fatalf("%v %v", done, err)
+	}
+	if i, _ := s.Instance(ctx, "inst_a"); i.Status != StatusBanned {
+		t.Fatalf("ban overwritten: %s", i.Status)
+	}
+	_ = s.SetStatus(ctx, "inst_a", StatusActive, nil, t0)
+	if done, _ := s.SuspendIfActive(ctx, "inst_a"); !done {
+		t.Fatal("active server not suspended")
+	}
+}
+
+func TestRevokeHandleTokenNeedsTheSameToken(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	_ = s.CreateInstance(ctx, inst("inst_a", "a@x.org"), 2)
+	_, _ = s.UpsertHandle(ctx, "h_1", "inst_a", "ios", "tok-a", []byte("s"), t0)
+	_ = s.RefreshHandleToken(ctx, "h_1", "inst_a", "tok-b", t0)
+	if err := s.RevokeHandleToken(ctx, "h_1", "tok-a", t0); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("old token revoked: %v", err)
+	}
+	if err := s.RevokeHandleToken(ctx, "h_1", "tok-b", t0); err != nil {
+		t.Fatal(err)
 	}
 }

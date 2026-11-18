@@ -27,21 +27,44 @@ import (
 	"github.com/MeshCore-Beacon/beacon-push/internal/store"
 )
 
-// fakePush records what would go to FCM and can be told to refuse a token.
+// fakePush records what would go to FCM. It can refuse a token, answer an error, wait, or run a hook first.
 type fakePush struct {
-	mu   sync.Mutex
-	sent []fcm.Message
-	gone map[string]bool
+	mu    sync.Mutex
+	sent  []fcm.Message
+	gone  map[string]bool
+	errs  map[string]error
+	delay time.Duration
+	hook  func(fcm.Message) error
+	calls atomic.Int64
 }
 
 func (f *fakePush) Send(_ context.Context, m fcm.Message) error {
+	f.calls.Add(1)
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.gone[m.Token] {
+	gone, err, delay, hook := f.gone[m.Token], f.errs[m.Token], f.delay, f.hook
+	f.mu.Unlock()
+	time.Sleep(delay)
+	if hook != nil {
+		if err := hook(m); err != nil {
+			return err
+		}
+	}
+	if gone {
 		return fcm.ErrUnregistered
 	}
+	if err != nil {
+		return err
+	}
+	f.mu.Lock()
 	f.sent = append(f.sent, m)
+	f.mu.Unlock()
 	return nil
+}
+
+func (f *fakePush) set(fn func(f *fakePush)) {
+	f.mu.Lock()
+	fn(f)
+	f.mu.Unlock()
 }
 
 func (f *fakePush) messages() []fcm.Message {
@@ -81,7 +104,7 @@ func newHarness(t *testing.T) *harness {
 	}
 	t.Cleanup(func() { st.Close() })
 	u, _ := url.Parse("https://push.test")
-	h := &harness{t: t, store: st, push: &fakePush{gone: map[string]bool{}}, mail: &mail.Recorder{},
+	h := &harness{t: t, store: st, push: &fakePush{gone: map[string]bool{}, errs: map[string]error{}}, mail: &mail.Recorder{},
 		clock: &clock{t: time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)}}
 	h.relay = New(Options{Config: config.Config{PublicURL: u, TrustProxy: true, DevMode: true, AdminEmail: "admin@test.example"},
 		Store: st, Push: h.push, Mail: h.mail, Now: h.clock.now})
@@ -357,7 +380,7 @@ func TestUnregisteredTokenRevokesTheHandle(t *testing.T) {
 	h := newHarness(t)
 	id, auth := h.register("A", "a@example.org", "")
 	dev := h.handle(id, "tok-gone")
-	h.push.gone["tok-gone"] = true
+	h.push.set(func(f *fakePush) { f.gone["tok-gone"] = true })
 	if res, _ := h.send(auth, SendItem{Handle: dev.Handle, Ciphertext: ct}); res[0].Status != StatusInvalidHandle {
 		t.Fatalf("%+v", res)
 	}
@@ -400,8 +423,9 @@ func TestRateLimits(t *testing.T) {
 	for i := range items {
 		items[i] = SendItem{Handle: dev.Handle, Ciphertext: ct}
 	}
+	// Items go out concurrently, so which one is refused is not fixed.
 	res, resp := h.send(auth, items...)
-	if res[HandlePerMinute-1].Status != StatusOK || res[HandlePerMinute].Status != StatusRateLimited || resp.Header.Get("Retry-After") == "" {
+	if count(res, StatusOK) != HandlePerMinute || count(res, StatusRateLimited) != 1 || resp.Header.Get("Retry-After") == "" {
 		t.Fatalf("per-device minute: %+v retry %q", res, resp.Header.Get("Retry-After"))
 	}
 
@@ -413,7 +437,7 @@ func TestRateLimits(t *testing.T) {
 	other := h.handle(id, "tok-2")
 	res, _ = h.send(auth, SendItem{Handle: other.Handle, Ciphertext: ct}, SendItem{Handle: other.Handle, Ciphertext: ct},
 		SendItem{Handle: other.Handle, Ciphertext: ct})
-	if res[0].Status != StatusOK || res[1].Status != StatusOK || res[2].Status != StatusRateLimited {
+	if count(res, StatusOK) != 2 || count(res, StatusRateLimited) != 1 {
 		t.Fatalf("daily quota: %+v", res)
 	}
 	var hello HelloResponse

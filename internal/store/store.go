@@ -94,6 +94,9 @@ var migrations = []string{
 		invalid_handle INTEGER NOT NULL DEFAULT 0,
 		PRIMARY KEY (instance_id, day)
 	);`,
+	// client_id is the sender's idempotency key; status is pending until FCM answers, then ok or failed.
+	`ALTER TABLE send_log ADD COLUMN client_id TEXT;
+	CREATE UNIQUE INDEX idx_send_log_client ON send_log (instance_id, client_id) WHERE client_id IS NOT NULL;`,
 }
 
 // Open opens (creating if needed) the database at path and brings its schema up to date.
@@ -302,6 +305,15 @@ func (s *Store) SetStatus(ctx context.Context, id, status string, emailHash []by
 	return nil
 }
 
+// SuspendIfActive suspends a server only while it is active, so it never overwrites a ban. It reports whether it did.
+func (s *Store) SuspendIfActive(ctx context.Context, id string) (bool, error) {
+	err := s.exec1(ctx, `UPDATE instances SET status = 'suspended' WHERE id = ? AND status = 'active'`, id)
+	if errors.Is(err, ErrNotFound) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 // SetQuota overrides a server's limits; 0 restores the tier default.
 func (s *Store) SetQuota(ctx context.Context, id string, perMinute, perDay int) error {
 	return s.exec1(ctx, `UPDATE instances SET quota_per_minute = ?, quota_per_day = ? WHERE id = ?`, perMinute, perDay, id)
@@ -396,6 +408,12 @@ func (s *Store) RevokeHandle(ctx context.Context, handle string, now time.Time) 
 	return s.exec1(ctx, `UPDATE handles SET revoked_at = ? WHERE handle = ? AND revoked_at = 0`, Ms(now), handle)
 }
 
+// RevokeHandleToken revokes a handle only while it still has the token, so a failure for an old token cannot
+// revoke a handle the app has since refreshed. ErrNotFound when the token changed or the handle is gone.
+func (s *Store) RevokeHandleToken(ctx context.Context, handle, token string, now time.Time) error {
+	return s.exec1(ctx, `UPDATE handles SET revoked_at = ? WHERE handle = ? AND fcm_token = ? AND revoked_at = 0`, Ms(now), handle, token)
+}
+
 // CountHandles counts a server's live handles.
 func (s *Store) CountHandles(ctx context.Context, instanceID string) (int, error) {
 	var n int
@@ -405,13 +423,15 @@ func (s *Store) CountHandles(ctx context.Context, instanceID string) (int, error
 
 // ── Sends and usage ─────────────────────────────────────────────────────────────────────────────
 
-// Send is one send-log row. The ciphertext itself is never stored, only its hash.
-type Send struct {
-	MessageID, InstanceID, Handle, Status string
-	At                                    time.Time
-	Size                                  int
-	CiphertextSHA256                      []byte
-}
+// Send-log statuses. A pending row holds its quota until FCM answers.
+const (
+	SendPending = "pending"
+	SendOK      = "ok"
+	SendFailed  = "failed"
+)
+
+// PendingTimeout is how long a pending send holds its idempotency key; after that it counts as failed.
+const PendingTimeout = 2 * time.Minute
 
 // Usage field names for BumpUsage.
 const (
@@ -420,24 +440,160 @@ const (
 	UsageInvalidHandle = "invalid_handle"
 )
 
-// RecordSend logs a delivered message and counts it.
-func (s *Store) RecordSend(ctx context.Context, r Send) error {
+// Reservation asks to count one send before it goes to FCM. The ciphertext itself is never stored, only its hash.
+type Reservation struct {
+	MessageID, InstanceID, Handle string
+	ClientID                      string // the sender's idempotency key; empty for none
+	At                            time.Time
+	Size                          int
+	CiphertextSHA256              []byte
+	InstancePerDay, GlobalPerDay  int
+	HandlePerDay                  int
+}
+
+// Reserve outcomes.
+type Outcome int
+
+const (
+	Reserved        Outcome = iota
+	AlreadySent             // the client ID went out before; the message ID is the earlier one
+	InFlight                // the client ID is being sent right now
+	OverInstanceDay         // the server's daily quota is used up
+	OverGlobalDay           // the relay's daily quota is used up
+	OverHandleDay           // the device's daily quota is used up
+	NotActive               // the server is no longer active
+)
+
+// Reserve checks the server's status, the client ID and every daily quota, and counts the send as pending, all in
+// one transaction so concurrent batches cannot pass the same count. It returns the message ID in use.
+func (s *Store) Reserve(ctx context.Context, r Reservation) (Outcome, string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, "", err
+	}
+	defer tx.Rollback()
+	var status string
+	if err := tx.QueryRowContext(ctx, `SELECT status FROM instances WHERE id = ?`, r.InstanceID).Scan(&status); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return NotActive, "", nil
+		}
+		return 0, "", err
+	}
+	if status != StatusActive {
+		return NotActive, "", nil
+	}
+	var clientID any
+	if r.ClientID != "" {
+		clientID = r.ClientID
+		var msgID, st string
+		var at int64
+		err := tx.QueryRowContext(ctx, `SELECT message_id, status, at FROM send_log WHERE instance_id = ? AND client_id = ?`,
+			r.InstanceID, r.ClientID).Scan(&msgID, &st, &at)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+		case err != nil:
+			return 0, "", err
+		case st == SendOK:
+			return AlreadySent, msgID, nil
+		case st == SendPending && Ms(r.At)-at < PendingTimeout.Milliseconds():
+			return InFlight, "", nil
+		default:
+			// A failed or abandoned earlier try: release it and send again.
+			if st == SendPending {
+				if err := release(ctx, tx, msgID); err != nil {
+					return 0, "", err
+				}
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE send_log SET client_id = NULL WHERE message_id = ?`, msgID); err != nil {
+				return 0, "", err
+			}
+		}
+	}
+	day := Day(r.At)
+	var mine, all, toHandle int
+	if err := tx.QueryRowContext(ctx, `SELECT coalesce(sum(sent), 0) FROM usage_daily WHERE instance_id = ? AND day = ?`, r.InstanceID, day).Scan(&mine); err != nil {
+		return 0, "", err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT coalesce(sum(sent), 0) FROM usage_daily WHERE day = ?`, day).Scan(&all); err != nil {
+		return 0, "", err
+	}
+	y, m, d := r.At.UTC().Date()
+	since := time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM send_log WHERE handle = ? AND at >= ? AND status IN ('pending', 'ok')`,
+		r.Handle, Ms(since)).Scan(&toHandle); err != nil {
+		return 0, "", err
+	}
+	switch {
+	case all >= r.GlobalPerDay:
+		return OverGlobalDay, "", nil
+	case mine >= r.InstancePerDay:
+		return OverInstanceDay, "", nil
+	case toHandle >= r.HandlePerDay:
+		return OverHandleDay, "", nil
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO send_log (message_id, instance_id, handle, at, size, ciphertext_sha256, status, client_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, r.MessageID, r.InstanceID, r.Handle, Ms(r.At), r.Size, r.CiphertextSHA256, SendPending, clientID); err != nil {
+		return 0, "", err
+	}
+	if err := bump(ctx, tx, r.InstanceID, day, UsageSent); err != nil {
+		return 0, "", err
+	}
+	return Reserved, r.MessageID, tx.Commit()
+}
+
+// FinishSend records FCM's answer for a reserved send. A send that did not go out gives its quota back.
+func (s *Store) FinishSend(ctx context.Context, messageID string, ok bool, at time.Time) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO send_log (message_id, instance_id, handle, at, size, ciphertext_sha256, status)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`, r.MessageID, r.InstanceID, r.Handle, Ms(r.At), r.Size, r.CiphertextSHA256, r.Status); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE handles SET last_sent_at = ? WHERE handle = ?`, Ms(r.At), r.Handle); err != nil {
-		return err
-	}
-	if err := bump(ctx, tx, r.InstanceID, Day(r.At), UsageSent); err != nil {
+	if ok {
+		var handle string
+		err := tx.QueryRowContext(ctx, `UPDATE send_log SET status = 'ok' WHERE message_id = ? AND status = 'pending' RETURNING handle`,
+			messageID).Scan(&handle)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE handles SET last_sent_at = ? WHERE handle = ?`, Ms(at), handle); err != nil {
+			return err
+		}
+	} else if err := release(ctx, tx, messageID); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+// release marks a pending send failed and takes it off its day's count.
+func release(ctx context.Context, tx *sql.Tx, messageID string) error {
+	var instanceID string
+	var at int64
+	err := tx.QueryRowContext(ctx, `UPDATE send_log SET status = 'failed' WHERE message_id = ? AND status = 'pending'
+		RETURNING instance_id, at`, messageID).Scan(&instanceID, &at)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE usage_daily SET sent = max(sent - 1, 0) WHERE instance_id = ? AND day = ?`,
+		instanceID, Day(time.UnixMilli(at)))
+	return err
+}
+
+// SentByClientID is the status and message ID of the send a client ID last named, or ErrNotFound. A cheap look
+// before rate limits are spent; Reserve decides for real.
+func (s *Store) SentByClientID(ctx context.Context, instanceID, clientID string) (status, messageID string, at time.Time, err error) {
+	var ms int64
+	err = s.db.QueryRowContext(ctx, `SELECT status, message_id, at FROM send_log WHERE instance_id = ? AND client_id = ?`,
+		instanceID, clientID).Scan(&status, &messageID, &ms)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", time.Time{}, ErrNotFound
+	}
+	return status, messageID, time.UnixMilli(ms), err
 }
 
 // BumpUsage adds one to a server's counter for the day.
@@ -497,10 +653,11 @@ func (s *Store) GlobalSentToday(ctx context.Context, at time.Time) (int, error) 
 	return n, err
 }
 
-// HandleSentSince counts what reached a handle since the time.
+// HandleSentSince counts what reached, or is on its way to, a handle since the time.
 func (s *Store) HandleSentSince(ctx context.Context, handle string, since time.Time) (int, error) {
 	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM send_log WHERE handle = ? AND at >= ?`, handle, Ms(since)).Scan(&n)
+	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM send_log WHERE handle = ? AND at >= ? AND status IN ('pending', 'ok')`,
+		handle, Ms(since)).Scan(&n)
 	return n, err
 }
 

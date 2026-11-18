@@ -9,6 +9,9 @@ import (
 	"encoding/base64"
 	"errors"
 	"net/http"
+	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/MeshCore-Beacon/beacon-push/internal/fcm"
@@ -66,7 +69,7 @@ func (s *Server) verifyDomain(w http.ResponseWriter, r *http.Request, inst store
 	writeJSON(w, http.StatusOK, map[string]any{"domainVerified": true})
 }
 
-// SendRequest is a batch of notifications from one server.
+// SendRequest is a batch from one server.
 type SendRequest struct {
 	Messages []SendItem `json:"messages"`
 }
@@ -77,26 +80,29 @@ type SendItem struct {
 	Ciphertext  string `json:"ciphertext"`            // standard base64
 	CollapseKey string `json:"collapseKey,omitempty"` // at most 40 of A-Z a-z 0-9 _ - . :
 	TTLSeconds  int    `json:"ttlSeconds,omitempty"`  // default one day, at most 28 days
+	ID          string `json:"id,omitempty"`          // idempotency key, at most 64 of A-Z a-z 0-9 _ - . :
 }
 
 // SendResult answers one item, in request order.
 type SendResult struct {
-	MessageID string `json:"messageId,omitempty"`
-	Status    string `json:"status" enums:"ok,rate_limited,invalid_handle,too_large,invalid,failed"`
+	MessageID         string `json:"messageId,omitempty"`
+	Status            string `json:"status" enums:"ok,rate_limited,invalid_handle,too_large,invalid,failed"`
+	RetryAfterSeconds int    `json:"retryAfterSeconds,omitempty"` // on rate_limited, and failed after an FCM outage
 }
 
 // Send statuses.
 const (
 	StatusOK            = "ok"
-	StatusRateLimited   = "rate_limited"
+	StatusRateLimited   = "rate_limited"   // not sent; retry after the wait, not an attempt
 	StatusInvalidHandle = "invalid_handle" // delete this device
 	StatusTooLarge      = "too_large"
 	StatusInvalid       = "invalid"
 	StatusFailed        = "failed" // retry later
 )
 
-func validCollapseKey(k string) bool {
-	if len(k) > MaxCollapseKey {
+// validKey is the alphabet of collapse keys and ids.
+func validKey(k string, max int) bool {
+	if len(k) > max {
 		return false
 	}
 	for _, c := range k {
@@ -114,9 +120,35 @@ func dayStart(t time.Time) time.Time {
 	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
 }
 
+func writeSuspended(w http.ResponseWriter, status string) {
+	if status == store.StatusBanned {
+		writeError(w, http.StatusForbidden, "banned", "This server is banned from the push relay.")
+		return
+	}
+	writeError(w, http.StatusForbidden, "suspended", "This server is suspended from the push relay. Contact abuse@meshcorebeacon.ca.")
+}
+
+// sendJob is an item that passed the checks and is ready to go to FCM.
+type sendJob struct {
+	i      int
+	item   SendItem
+	ct     []byte
+	handle store.Handle
+}
+
+// batch is what every item of one send shares.
+type batch struct {
+	inst     store.Instance
+	tier     Tier
+	now      time.Time
+	deadline time.Time       // wall clock: items not started by then are deferred
+	db       context.Context // outlives the request, so a reply already sent is still recorded
+	stop     atomic.Bool     // the store failed: start nothing more
+}
+
 func (s *Server) send(w http.ResponseWriter, r *http.Request, inst store.Instance) {
 	if inst.Status != store.StatusActive {
-		writeError(w, http.StatusForbidden, "suspended", "This server is suspended from the push relay. Contact abuse@meshcorebeacon.ca.")
+		writeSuspended(w, inst.Status)
 		return
 	}
 	var req SendRequest
@@ -128,40 +160,31 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, inst store.Instanc
 		return
 	}
 	ctx := r.Context()
-	// One batch per server at a time, so concurrent requests cannot each pass the daily check on the same count.
-	unlock := s.lockInstance(inst.ID)
+	// One batch per server at a time, so its harvesting count and limits see every earlier batch.
+	unlock, err := s.lockInstance(ctx, inst.ID)
+	if err != nil {
+		return
+	}
 	defer unlock()
-	now := s.now()
-	tier := TierFor(inst)
-	sentToday, err := s.store.SentToday(ctx, inst.ID, now)
+	// A batch that waited may be behind a suspension, ban or quota change.
+	inst, err = s.store.Instance(ctx, inst.ID)
 	if err != nil {
-		s.internal(w, "usage read failed", err)
+		s.internal(w, "instance reload failed", err)
 		return
 	}
-	globalToday, err := s.store.GlobalSentToday(ctx, now)
-	if err != nil {
-		s.internal(w, "usage read failed", err)
+	if inst.Status != store.StatusActive {
+		writeSuspended(w, inst.Status)
 		return
 	}
+	b := &batch{inst: inst, tier: TierFor(inst), now: s.now(), deadline: time.Now().Add(s.batchDeadline), db: context.WithoutCancel(ctx)}
 
 	results := make([]SendResult, len(req.Messages))
-	var wait time.Duration
-	limited := func(i int, d time.Duration) {
-		results[i].Status = StatusRateLimited
-		if d > wait {
-			wait = d
-		}
-		if err := s.store.BumpUsage(ctx, inst.ID, now, store.UsageRateLimited); err != nil {
-			s.log.Warn("usage not counted", "component", "relay", "push_id", inst.ID, "err", err)
-		}
-	}
-	untilTomorrow := dayStart(now).Add(24 * time.Hour).Sub(now)
-
+	var jobs []sendJob
 	for i, item := range req.Messages {
 		ct, err := base64.StdEncoding.DecodeString(item.Ciphertext)
 		switch {
-		case err != nil || len(ct) == 0 || !validCollapseKey(item.CollapseKey) || item.TTLSeconds < 0 ||
-			int64(item.TTLSeconds) > int64(MaxTTL/time.Second): // compare seconds, a Duration product can overflow
+		case err != nil || len(ct) == 0 || !validKey(item.CollapseKey, MaxCollapseKey) || !validKey(item.ID, MaxClientID) ||
+			item.TTLSeconds < 0 || int64(item.TTLSeconds) > int64(MaxTTL/time.Second): // compare seconds, a Duration product can overflow
 			results[i].Status = StatusInvalid
 			continue
 		case len(ct) > MaxCiphertext:
@@ -174,96 +197,200 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, inst store.Instanc
 			s.internal(w, "handle lookup failed", err)
 			return
 		}
-		missing := errors.Is(err, store.ErrNotFound)
-		// Only another server's live handle proves harvesting. A missing one may simply have been purged, and a
-		// guessed one reaches nobody.
-		stolen := !missing && h.InstanceID != inst.ID && h.RevokedAt == 0
-		if s.harvest.add(inst.ID, stolen, now) {
-			s.suspendForHarvesting(ctx, inst)
-			writeError(w, http.StatusForbidden, "suspended", "This server is suspended from the push relay. Contact abuse@meshcorebeacon.ca.")
+		// Only live handles count towards harvesting: a missing one may have been purged and reaches nobody, so it
+		// can neither prove harvesting nor dilute it.
+		live := err == nil && h.RevokedAt == 0
+		foreign := live && h.InstanceID != inst.ID
+		if live && s.harvest.add(inst.ID, foreign, b.now) {
+			s.suspendForHarvesting(b.db, inst)
+			writeSuspended(w, store.StatusSuspended)
 			return
 		}
-		if missing || stolen || h.RevokedAt != 0 {
+		if !live || foreign {
 			results[i].Status = StatusInvalidHandle
-			if err := s.store.BumpUsage(ctx, inst.ID, now, store.UsageInvalidHandle); err != nil {
-				s.log.Warn("usage not counted", "component", "relay", "push_id", inst.ID, "err", err)
-			}
+			s.bump(b, store.UsageInvalidHandle)
 			continue
 		}
+		jobs = append(jobs, sendJob{i: i, item: item, ct: ct, handle: h})
+	}
 
-		if globalToday >= GlobalPerDay {
-			s.log.Warn("global daily push limit reached", "component", "relay", "limit", GlobalPerDay)
-			limited(i, untilTomorrow)
-			continue
-		}
-		if sentToday >= tier.PerDay {
-			limited(i, untilTomorrow)
-			continue
-		}
-		if ok, d := s.minute.Allow("inst:"+inst.ID, tier.PerMinute, now); !ok {
-			limited(i, d)
-			continue
-		}
-		if ok, d := s.minute.Allow("handle:"+h.Handle, HandlePerMinute, now); !ok {
-			limited(i, d)
-			continue
-		}
-		toHandle, err := s.store.HandleSentSince(ctx, h.Handle, dayStart(now))
-		if err != nil {
-			s.internal(w, "handle usage read failed", err)
-			return
-		}
-		if toHandle >= HandlePerDay {
-			limited(i, untilTomorrow)
-			continue
-		}
+	next := make(chan sendJob)
+	var wg sync.WaitGroup
+	for range min(s.sendWorkers, len(jobs)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range next {
+				results[j.i] = s.sendOne(ctx, b, j)
+			}
+		}()
+	}
+	for _, j := range jobs {
+		next <- j
+	}
+	close(next)
+	wg.Wait()
 
-		msgID := "m_" + randomString(16)
-		ttl := DefaultTTL
-		if item.TTLSeconds > 0 {
-			ttl = time.Duration(item.TTLSeconds) * time.Second
-		}
-		collapse := ""
-		if item.CollapseKey != "" {
-			collapse = inst.ID + ":" + item.CollapseKey
-		}
-		err = s.push.Send(ctx, fcm.Message{
-			Token: h.FCMToken,
-			Data: map[string]string{"v": "1", "pushId": inst.ID, "serverName": inst.Name, "messageId": msgID,
-				"ct": base64.StdEncoding.EncodeToString(ct)},
-			CollapseKey: collapse, TTL: ttl, AlertTitle: inst.Name, AlertBody: "New alert",
-		})
-		switch {
-		case err == nil:
-			sum := sha256.Sum256(ct)
-			if err := s.store.RecordSend(ctx, store.Send{MessageID: msgID, InstanceID: inst.ID, Handle: h.Handle, Status: StatusOK,
-				At: now, Size: len(ct), CiphertextSHA256: sum[:]}); err != nil {
-				s.log.Error("send not recorded", "component", "relay", "push_id", inst.ID, "err", err)
-			}
-			sentToday++
-			globalToday++
-			results[i] = SendResult{MessageID: msgID, Status: StatusOK}
-		case errors.Is(err, fcm.ErrUnregistered):
-			if err := s.store.RevokeHandle(ctx, h.Handle, now); err != nil && !errors.Is(err, store.ErrNotFound) {
-				s.log.Warn("handle not revoked", "component", "relay", "push_id", inst.ID, "err", err)
-			}
-			_ = s.store.BumpUsage(ctx, inst.ID, now, store.UsageInvalidHandle)
-			results[i].Status = StatusInvalidHandle
-		default:
-			s.log.Warn("push not delivered", "component", "relay", "push_id", inst.ID, "err", err)
-			results[i].Status = StatusFailed
-		}
+	wait := 0
+	for _, res := range results {
+		wait = max(wait, res.RetryAfterSeconds)
 	}
 	if wait > 0 {
-		w.Header().Set("Retry-After", retryAfter(wait))
+		w.Header().Set("Retry-After", strconv.Itoa(wait))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"results": results})
 }
 
+func (s *Server) bump(b *batch, field string) {
+	if err := s.store.BumpUsage(b.db, b.inst.ID, b.now, field); err != nil {
+		s.log.Warn("usage not counted", "component", "relay", "push_id", b.inst.ID, "err", err)
+	}
+}
+
+func (s *Server) limited(b *batch, d time.Duration) SendResult {
+	s.bump(b, store.UsageRateLimited)
+	return SendResult{Status: StatusRateLimited, RetryAfterSeconds: seconds(d)}
+}
+
+// seconds rounds a wait up to whole seconds, at least one.
+func seconds(d time.Duration) int {
+	return max(int((d+time.Second-1)/time.Second), 1)
+}
+
+// storeFailed stops the batch: without durable accounting nothing more may go out.
+func (s *Server) storeFailed(b *batch, what string, err error) SendResult {
+	s.log.Error(what, "component", "relay", "push_id", b.inst.ID, "err", err)
+	b.stop.Store(true)
+	return SendResult{Status: StatusFailed}
+}
+
+// sendOne reserves quota for one item, hands it to FCM and records the answer.
+func (s *Server) sendOne(ctx context.Context, b *batch, j sendJob) SendResult {
+	inst, h := b.inst, j.handle
+	if b.stop.Load() {
+		return SendResult{Status: StatusFailed}
+	}
+	if time.Now().After(b.deadline) || ctx.Err() != nil {
+		return s.limited(b, DeferredRetry)
+	}
+	if d := s.pausedFor(s.now()); d > 0 {
+		return s.limited(b, d)
+	}
+	if j.item.ID != "" {
+		// A cheap look first, so a repeat spends no rate limit. Reserve decides for real.
+		st, msgID, at, err := s.store.SentByClientID(b.db, inst.ID, j.item.ID)
+		switch {
+		case err == nil && st == store.SendOK:
+			return SendResult{MessageID: msgID, Status: StatusOK}
+		case err == nil && st == store.SendPending && b.now.Sub(at) < store.PendingTimeout:
+			return s.limited(b, InFlightRetry)
+		case err != nil && !errors.Is(err, store.ErrNotFound):
+			return s.storeFailed(b, "send lookup failed", err)
+		}
+	}
+	if ok, d := s.minute.Allow("inst:"+inst.ID, b.tier.PerMinute, b.now); !ok {
+		return s.limited(b, d)
+	}
+	if ok, d := s.minute.Allow("handle:"+h.Handle, HandlePerMinute, b.now); !ok {
+		return s.limited(b, d)
+	}
+
+	sum := sha256.Sum256(j.ct)
+	outcome, msgID, err := s.store.Reserve(b.db, store.Reservation{MessageID: "m_" + randomString(16), InstanceID: inst.ID,
+		Handle: h.Handle, ClientID: j.item.ID, At: b.now, Size: len(j.ct), CiphertextSHA256: sum[:],
+		InstancePerDay: b.tier.PerDay, GlobalPerDay: GlobalPerDay, HandlePerDay: HandlePerDay})
+	if err != nil {
+		return s.storeFailed(b, "send not reserved", err)
+	}
+	untilTomorrow := dayStart(b.now).Add(24 * time.Hour).Sub(b.now)
+	switch outcome {
+	case store.AlreadySent:
+		return SendResult{MessageID: msgID, Status: StatusOK}
+	case store.InFlight:
+		return s.limited(b, InFlightRetry)
+	case store.OverGlobalDay:
+		s.log.Warn("global daily push limit reached", "component", "relay", "limit", GlobalPerDay)
+		return s.limited(b, untilTomorrow)
+	case store.OverInstanceDay, store.OverHandleDay:
+		return s.limited(b, untilTomorrow)
+	case store.NotActive:
+		b.stop.Store(true)
+		return SendResult{Status: StatusFailed}
+	}
+
+	ttl := DefaultTTL
+	if j.item.TTLSeconds > 0 {
+		ttl = time.Duration(j.item.TTLSeconds) * time.Second
+	}
+	collapse := ""
+	if j.item.CollapseKey != "" {
+		collapse = inst.ID + ":" + j.item.CollapseKey
+	}
+	// Not cancelled with the request: FCM bounds each call, and an abandoned call would leave its outcome unknown.
+	err = s.push.Send(b.db, fcm.Message{
+		Token: h.FCMToken,
+		Data: map[string]string{"v": "1", "pushId": inst.ID, "serverName": inst.Name, "messageId": msgID,
+			"ct": base64.StdEncoding.EncodeToString(j.ct)},
+		CollapseKey: collapse, TTL: ttl, AlertTitle: inst.Name, AlertBody: "New alert",
+	})
+	fctx, cancel := context.WithTimeout(b.db, finishSendTimeout)
+	defer cancel()
+	if ferr := s.store.FinishSend(fctx, msgID, err == nil, s.now()); ferr != nil {
+		s.log.Error("send outcome not recorded", "component", "relay", "push_id", inst.ID, "err", ferr)
+	}
+	var fe *fcm.Error
+	switch {
+	case err == nil:
+		return SendResult{MessageID: msgID, Status: StatusOK}
+	case errors.Is(err, fcm.ErrUnregistered):
+		return s.unregistered(fctx, b, h)
+	case errors.Is(err, fcm.ErrInvalidArgument):
+		return SendResult{Status: StatusInvalid}
+	case errors.As(err, &fe) && fe.Status == http.StatusTooManyRequests:
+		d := fe.RetryAfter
+		if d <= 0 {
+			d = FCMThrottleRetry
+		}
+		return s.limited(b, d)
+	case errors.As(err, &fe) && (fe.Status == http.StatusInternalServerError || fe.Status == http.StatusServiceUnavailable):
+		d := s.pauseFCM(s.now(), fe.RetryAfter)
+		s.log.Warn("fcm unavailable, relay paused", "component", "relay", "status", fe.Status, "pause", d.String())
+		return SendResult{Status: StatusFailed, RetryAfterSeconds: seconds(d)}
+	}
+	s.log.Warn("push not delivered", "component", "relay", "push_id", inst.ID, "err", err)
+	return SendResult{Status: StatusFailed}
+}
+
+// unregistered revokes a handle FCM no longer knows, unless the app moved it to a new token meanwhile.
+func (s *Server) unregistered(ctx context.Context, b *batch, h store.Handle) SendResult {
+	err := s.store.RevokeHandleToken(ctx, h.Handle, h.FCMToken, s.now())
+	if errors.Is(err, store.ErrNotFound) {
+		cur, cerr := s.store.Handle(ctx, h.Handle)
+		switch {
+		case errors.Is(cerr, store.ErrNotFound), cerr == nil && cur.RevokedAt != 0 && cur.FCMToken == h.FCMToken:
+			err = nil // already gone for this token
+		case cerr == nil:
+			return SendResult{Status: StatusFailed} // a fresh token: retry reaches it
+		default:
+			err = cerr
+		}
+	}
+	if err != nil {
+		s.log.Warn("handle not revoked", "component", "relay", "push_id", b.inst.ID, "err", err)
+		return SendResult{Status: StatusFailed}
+	}
+	s.bump(b, store.UsageInvalidHandle)
+	return SendResult{Status: StatusInvalidHandle}
+}
+
 func (s *Server) suspendForHarvesting(ctx context.Context, inst store.Instance) {
-	if err := s.store.SetStatus(ctx, inst.ID, store.StatusSuspended, nil, s.now()); err != nil {
+	done, err := s.store.SuspendIfActive(ctx, inst.ID)
+	if err != nil {
 		s.log.Error("automatic suspension failed", "component", "relay", "push_id", inst.ID, "err", err)
 		return
+	}
+	if !done {
+		return // banned or suspended meanwhile
 	}
 	s.log.Warn("server suspended automatically: too many unknown device handles", "component", "relay", "push_id", inst.ID)
 	go s.notifyAdmin(ctx, "Push server suspended automatically: "+inst.ID,

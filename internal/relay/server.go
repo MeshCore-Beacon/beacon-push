@@ -53,13 +53,27 @@ const (
 	MaxBatch          = 100
 	MaxCiphertext     = 2048
 	MaxCollapseKey    = 40
+	MaxClientID       = 64
 	MaxTTL            = 28 * 24 * time.Hour
 	DefaultTTL        = 24 * time.Hour
 	LinkLifetime      = 24 * time.Hour
 	DomainRecheck     = 24 * time.Hour
 	TermsVersion      = 1
-	harvestMinSends   = 100
+	harvestMinSends   = 100 // live handles in an hour before the ratio applies
 	harvestBadPercent = 20
+	harvestForeignMax = 50 // another server's live handles in an hour, whatever the ratio
+)
+
+// Send timing. A batch answers within about BatchDeadline plus one FCM call (10 s).
+const (
+	SendWorkers       = 8
+	BatchDeadline     = 10 * time.Second
+	DeferredRetry     = 5 * time.Second  // an item not started before the deadline
+	InFlightRetry     = 30 * time.Second // an id whose earlier send has no answer yet
+	FCMPauseDefault   = time.Minute      // after FCM 500/503 without Retry-After
+	FCMPauseMax       = time.Hour
+	FCMThrottleRetry  = time.Minute // after FCM 429 without Retry-After
+	finishSendTimeout = 5 * time.Second
 )
 
 // Options builds a Server. Now, ChallengeClient and Logger are optional.
@@ -83,17 +97,23 @@ type Server struct {
 	challenge *http.Client
 	log       *slog.Logger
 
-	minute, hour *limit.Window
-	harvest      harvestCounter
-	checking     sync.Map // server ID -> struct{}, a domain check in flight
-	sending      sync.Map // server ID -> *sync.Mutex, held for one send batch
-	reviewed     sync.Map // server ID -> struct{}, the device-count review notice was sent
+	minute, hour  *limit.Window
+	harvest       harvestCounter
+	checking      sync.Map // server ID -> struct{}, a domain check in flight
+	sending       sync.Map // server ID -> chan struct{}, a one-slot lock held for one send batch
+	reviewed      sync.Map // server ID -> struct{}, the device-count review notice was sent
+	sendWorkers   int
+	batchDeadline time.Duration
+
+	pauseMu     sync.Mutex
+	pausedUntil time.Time // FCM asked every sender to back off until then
 }
 
 // New builds the relay.
 func New(o Options) *Server {
 	s := &Server{cfg: o.Config, store: o.Store, push: o.Push, mail: o.Mail, now: o.Now, challenge: o.ChallengeClient, log: o.Logger,
-		minute: limit.New(time.Minute), hour: limit.New(time.Hour), harvest: harvestCounter{m: map[string]*harvestSlot{}}}
+		minute: limit.New(time.Minute), hour: limit.New(time.Hour), harvest: harvestCounter{m: map[string]*harvestSlot{}},
+		sendWorkers: SendWorkers, batchDeadline: BatchDeadline}
 	if s.now == nil {
 		s.now = time.Now
 	}
@@ -143,12 +163,37 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-// lockInstance serialises send batches per server and returns the unlock.
-func (s *Server) lockInstance(id string) func() {
-	m, _ := s.sending.LoadOrStore(id, &sync.Mutex{})
-	mu := m.(*sync.Mutex)
-	mu.Lock()
-	return mu.Unlock
+// lockInstance serialises send batches per server and returns the unlock. The wait ends with ctx.
+func (s *Server) lockInstance(ctx context.Context, id string) (func(), error) {
+	v, _ := s.sending.LoadOrStore(id, make(chan struct{}, 1))
+	slot := v.(chan struct{})
+	select {
+	case slot <- struct{}{}:
+		return func() { <-slot }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// pausedFor is how long the relay still waits after FCM asked it to back off.
+func (s *Server) pausedFor(now time.Time) time.Duration {
+	s.pauseMu.Lock()
+	defer s.pauseMu.Unlock()
+	return s.pausedUntil.Sub(now)
+}
+
+// pauseFCM stops every send for FCM's Retry-After, bounded, and returns the wait it applied.
+func (s *Server) pauseFCM(now time.Time, d time.Duration) time.Duration {
+	if d <= 0 {
+		d = FCMPauseDefault
+	}
+	d = min(d, FCMPauseMax)
+	s.pauseMu.Lock()
+	defer s.pauseMu.Unlock()
+	if until := now.Add(d); until.After(s.pausedUntil) {
+		s.pausedUntil = until
+	}
+	return d
 }
 
 // clientIP is the caller's address: behind Caddy the last X-Forwarded-For entry across every header line, which is
@@ -320,22 +365,21 @@ func (s *Server) notifyAdmin(ctx context.Context, subject, text string) {
 
 // ── Harvesting detection ────────────────────────────────────────────────────────────────────────
 
-// harvestCounter counts, per server and hour, the handles it addressed and how many belong to another server: a
-// server trying handles it harvested elsewhere.
+// harvestCounter counts, per server and hour, the live handles it addressed and how many belong to another server:
+// a server trying handles it harvested elsewhere. Missing and revoked handles prove nothing either way.
 type harvestCounter struct {
 	mu sync.Mutex
 	m  map[string]*harvestSlot
 }
 
 type harvestSlot struct {
-	start     time.Time
-	sends     int
-	bad       int
-	suspended bool
+	start         time.Time
+	live, foreign int
+	suspended     bool
 }
 
-// add counts one addressed handle and reports whether the server just crossed the line.
-func (h *harvestCounter) add(id string, bad bool, now time.Time) bool {
+// add counts one live handle and reports whether the server just crossed the line.
+func (h *harvestCounter) add(id string, foreign bool, now time.Time) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	s := h.m[id]
@@ -343,11 +387,11 @@ func (h *harvestCounter) add(id string, bad bool, now time.Time) bool {
 		s = &harvestSlot{start: now}
 		h.m[id] = s
 	}
-	s.sends++
-	if bad {
-		s.bad++
+	s.live++
+	if foreign {
+		s.foreign++
 	}
-	if !s.suspended && s.sends >= harvestMinSends && s.bad*100 > s.sends*harvestBadPercent {
+	if !s.suspended && (s.foreign >= harvestForeignMax || (s.live >= harvestMinSends && s.foreign*100 > s.live*harvestBadPercent)) {
 		s.suspended = true
 		return true
 	}

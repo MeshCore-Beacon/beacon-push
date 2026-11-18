@@ -302,16 +302,30 @@ func TestSuspendIfActiveKeepsABan(t *testing.T) {
 	}
 }
 
-func TestRevokeHandleTokenNeedsTheSameToken(t *testing.T) {
+func TestRevokeHandleTokenNeedsTheSameRegistration(t *testing.T) {
 	s := open(t)
 	ctx := context.Background()
 	_ = s.CreateInstance(ctx, inst("inst_a", "a@x.org"), 2)
 	_, _ = s.UpsertHandle(ctx, "h_1", "inst_a", "ios", "tok-a", "sandbox", []byte("s"), t0)
-	_ = s.RefreshHandleToken(ctx, "h_1", "inst_a", "tok-b", "production", t0)
-	if err := s.RevokeHandleToken(ctx, "h_1", "tok-a", t0); !errors.Is(err, ErrNotFound) {
+	first, _ := s.Handle(ctx, "h_1")
+	_ = s.RefreshHandleToken(ctx, "h_1", "inst_a", "tok-b", "production", t0.Add(time.Second))
+	if err := s.RevokeHandleToken(ctx, first, t0); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("old token revoked: %v", err)
 	}
-	if err := s.RevokeHandleToken(ctx, "h_1", "tok-b", t0); err != nil {
+	// Only the environment changes.
+	cur, _ := s.Handle(ctx, "h_1")
+	_ = s.RefreshHandleToken(ctx, "h_1", "inst_a", "tok-b", "sandbox", t0.Add(2*time.Second))
+	if err := s.RevokeHandleToken(ctx, cur, t0); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("old environment revoked: %v", err)
+	}
+	// The same token and environment, registered again later.
+	cur, _ = s.Handle(ctx, "h_1")
+	_, _ = s.UpsertHandle(ctx, "h_2", "inst_a", "ios", "tok-b", "sandbox", []byte("s2"), t0.Add(3*time.Second))
+	if err := s.RevokeHandleToken(ctx, cur, t0); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("re-registered handle revoked: %v", err)
+	}
+	cur, _ = s.Handle(ctx, "h_1")
+	if err := s.RevokeHandleToken(ctx, cur, t0); err != nil {
 		t.Fatal(err)
 	}
 }

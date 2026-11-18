@@ -379,6 +379,55 @@ func TestStaleUnregisteredKeepsARefreshedHandle(t *testing.T) {
 	}
 }
 
+func TestStaleUnregisteredKeepsACorrectedEnvironment(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	id, auth := h.register("A", "a@example.org", "")
+	dev := h.iosHandle(id, apnsToken, "production").Handle
+	h.push.set(func(f *fakePush) {
+		f.hook = func(m push.Message) error {
+			h.clock.add(time.Second)
+			if err := h.store.RefreshHandleToken(ctx, dev, id, apnsToken, "sandbox", h.clock.now()); err != nil {
+				t.Error(err)
+			}
+			return &push.Error{Provider: push.APNs, Status: 400, Code: "BadDeviceToken", Kind: push.ErrUnregistered}
+		}
+	})
+	if res, _ := h.send(auth, items(dev)...); res[0].Status != StatusFailed {
+		t.Fatalf("%+v", res)
+	}
+	if hd, _ := h.store.Handle(ctx, dev); hd.RevokedAt != 0 || hd.APNsEnv != "sandbox" {
+		t.Fatalf("corrected handle revoked: %+v", hd)
+	}
+}
+
+func TestStaleUnregisteredKeepsARegistrationMadeAgain(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	id, auth := h.register("A", "a@example.org", "")
+	dev := h.iosHandle(id, apnsToken, "production").Handle
+	h.push.set(func(f *fakePush) {
+		f.hook = func(m push.Message) error {
+			h.clock.add(time.Second)
+			if _, err := h.store.UpsertHandle(ctx, "h_new", id, "ios", apnsToken, "production", []byte("s"), h.clock.now()); err != nil {
+				t.Error(err)
+			}
+			return &push.Error{Provider: push.APNs, Status: 410, Code: "Unregistered", Kind: push.ErrUnregistered}
+		}
+	})
+	if res, _ := h.send(auth, items(dev)...); res[0].Status != StatusFailed {
+		t.Fatalf("%+v", res)
+	}
+	if hd, _ := h.store.Handle(ctx, dev); hd.RevokedAt != 0 {
+		t.Fatalf("re-registered handle revoked: %+v", hd)
+	}
+	// Without a change in between, the same answer revokes it.
+	h.push.set(func(f *fakePush) { f.hook = nil; f.errs[apnsToken] = push.ErrUnregistered })
+	if res, _ := h.send(auth, items(dev)...); res[0].Status != StatusInvalidHandle {
+		t.Fatalf("%+v", res)
+	}
+}
+
 func TestFCMOutagePausesTheRelay(t *testing.T) {
 	h := newHarness(t)
 	id, auth := h.register("A", "a@example.org", "")

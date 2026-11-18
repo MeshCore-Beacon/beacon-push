@@ -439,16 +439,17 @@ func (s *Server) finishSend(b *batch, msgID string, ok bool) error {
 	return err
 }
 
-// unregistered revokes a handle its provider no longer knows, unless the app moved it to a new token meanwhile.
+// unregistered revokes a handle its provider no longer knows, unless the app refreshed or registered it again
+// meanwhile.
 func (s *Server) unregistered(ctx context.Context, b *batch, h store.Handle) SendResult {
-	err := s.store.RevokeHandleToken(ctx, h.Handle, h.Token, s.now())
+	err := s.store.RevokeHandleToken(ctx, h, s.now())
 	if errors.Is(err, store.ErrNotFound) {
 		cur, cerr := s.store.Handle(ctx, h.Handle)
 		switch {
 		case errors.Is(cerr, store.ErrNotFound), cerr == nil && cur.RevokedAt != 0 && cur.Token == h.Token:
 			err = nil // already gone for this token
 		case cerr == nil:
-			return SendResult{Status: StatusFailed} // a fresh token: retry reaches it
+			return SendResult{Status: StatusFailed} // a newer registration: retry reaches it
 		default:
 			err = cerr
 		}

@@ -445,10 +445,12 @@ func (s *Store) RevokeHandle(ctx context.Context, handle string, now time.Time) 
 	return s.exec1(ctx, `UPDATE handles SET revoked_at = ? WHERE handle = ? AND revoked_at = 0`, Ms(now), handle)
 }
 
-// RevokeHandleToken revokes a handle only while it still has the token, so a failure for an old token cannot
-// revoke a handle the app has since refreshed. ErrNotFound when the token changed or the handle is gone.
-func (s *Store) RevokeHandleToken(ctx context.Context, handle, token string, now time.Time) error {
-	return s.exec1(ctx, `UPDATE handles SET revoked_at = ? WHERE handle = ? AND token = ? AND revoked_at = 0`, Ms(now), handle, token)
+// RevokeHandleToken revokes a handle only while it is still the registration a send went to: same token, APNs
+// environment and refresh time. A late failure cannot revoke what the app has since refreshed or registered again.
+// ErrNotFound when the row changed or the handle is gone.
+func (s *Store) RevokeHandleToken(ctx context.Context, sent Handle, now time.Time) error {
+	return s.exec1(ctx, `UPDATE handles SET revoked_at = ? WHERE handle = ? AND token = ? AND coalesce(apns_env, '') = ?
+		AND refreshed_at = ? AND revoked_at = 0`, Ms(now), sent.Handle, sent.Token, sent.APNsEnv, sent.RefreshedAt)
 }
 
 // CountHandles counts a server's live handles.

@@ -444,3 +444,147 @@ func TestFCMInvalidArgumentIsInvalid(t *testing.T) {
 		t.Fatal("a refused message revoked the handle")
 	}
 }
+
+func TestSlowUpstreamCannotHoldTheBatch(t *testing.T) {
+	h := newHarness(t)
+	id, auth := h.register("A", "a@example.org", "")
+	devs := h.devices(id, 3)
+	h.relay.batchDeadline, h.relay.sendLimit = 100*time.Millisecond, 200*time.Millisecond
+	h.push.set(func(f *fakePush) { f.delay = 5 * time.Second })
+	start := time.Now()
+	res, _ := h.send(auth, items(devs...)...)
+	if took := time.Since(start); took > 2*time.Second || count(res, StatusFailed) != 3 {
+		t.Fatalf("took %s: %+v", took, res)
+	}
+}
+
+func TestUnrecordedSuccessIsNotOK(t *testing.T) {
+	h := newHarness(t)
+	id, auth := h.register("A", "a@example.org", "")
+	devs := h.devices(id, 2)
+	h.relay.sendWorkers = 1
+	if _, err := h.store.DB().Exec(`CREATE TRIGGER no_ok BEFORE UPDATE OF status ON send_log WHEN NEW.status = 'ok'
+		BEGIN SELECT RAISE(ABORT, 'disk full'); END`); err != nil {
+		t.Fatal(err)
+	}
+	res, _ := h.send(auth, SendItem{Handle: devs[0], Ciphertext: ct, ID: "1:a"}, SendItem{Handle: devs[1], Ciphertext: ct, ID: "1:b"})
+	if res[0].Status != StatusFailed || res[1].Status != StatusFailed || len(h.push.messages()) != 1 {
+		t.Fatalf("%+v, %d pushed", res, len(h.push.messages()))
+	}
+	// The send stays pending, so a repeat waits and, after two minutes, sends again.
+	if res, _ := h.send(auth, SendItem{Handle: devs[0], Ciphertext: ct, ID: "1:a"}); res[0].Status != StatusRateLimited {
+		t.Fatalf("repeat while pending: %+v", res)
+	}
+}
+
+func TestSentIDAnswersOKWhateverElseChanged(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	id, auth := h.register("A", "a@example.org", "")
+	dev := h.devices(id, 1)[0]
+	item := SendItem{Handle: dev, Ciphertext: ct, ID: "7:x"}
+	first, _ := h.send(auth, item)
+	if first[0].Status != StatusOK {
+		t.Fatalf("%+v", first)
+	}
+	usage := func() store.Usage {
+		u, _ := h.store.UsageFor(ctx, id, 1)
+		return u[0]
+	}
+	before := usage()
+	h.relay.pauseFCM(h.clock.now(), time.Hour)
+	if res, _ := h.send(auth, item); res[0].Status != StatusOK || res[0].MessageID != first[0].MessageID {
+		t.Fatalf("repeat during a pause: %+v", res)
+	}
+	if err := h.store.RevokeHandle(ctx, dev, h.clock.now()); err != nil {
+		t.Fatal(err)
+	}
+	if res, _ := h.send(auth, item); res[0].Status != StatusOK || res[0].MessageID != first[0].MessageID {
+		t.Fatalf("repeat after the handle went: %+v", res)
+	}
+	if after := usage(); after != before || h.push.calls.Load() != 1 {
+		t.Fatalf("a repeat was counted or sent: %+v -> %+v", before, after)
+	}
+}
+
+func TestQuotaChangeAppliesMidBatch(t *testing.T) {
+	h := newHarness(t)
+	id, auth := h.register("A", "a@example.org", "")
+	devs := h.devices(id, 3)
+	h.relay.sendWorkers = 1
+	lower := func(perMinute, perDay int) {
+		var once sync.Once
+		h.push.set(func(f *fakePush) {
+			f.hook = func(fcm.Message) error {
+				once.Do(func() {
+					if err := h.store.SetQuota(context.Background(), id, perMinute, perDay); err != nil {
+						t.Error(err)
+					}
+				})
+				return nil
+			}
+		})
+	}
+	lower(0, 1)
+	res, _ := h.send(auth, items(devs...)...)
+	if count(res, StatusOK) != 1 || count(res, StatusRateLimited) != 2 {
+		t.Fatalf("daily quota lowered mid-batch: %+v", res)
+	}
+	h.clock.add(24 * time.Hour)
+	_ = h.store.SetQuota(context.Background(), id, 10_000, 10_000)
+	lower(1, 10_000)
+	res, _ = h.send(auth, items(devs...)...)
+	if count(res, StatusOK) != 1 || count(res, StatusRateLimited) != 2 {
+		t.Fatalf("minute quota lowered mid-batch: %+v", res)
+	}
+}
+
+func TestFCMThrottleCoolsTheDevice(t *testing.T) {
+	h := newHarness(t)
+	id, auth := h.register("A", "a@example.org", "")
+	devs := h.devices(id, 2)
+	h.relay.sendWorkers = 1
+	h.push.set(func(f *fakePush) { f.errs["tok-0"] = &fcm.Error{Status: 429, RetryAfter: 30 * time.Second} })
+	res, _ := h.send(auth, items(devs[0], devs[0], devs[1])...)
+	if res[0].Status != StatusRateLimited || res[0].RetryAfterSeconds != 30 || res[1].Status != StatusRateLimited ||
+		res[1].RetryAfterSeconds != 30 || res[2].Status != StatusOK || h.push.calls.Load() != 2 {
+		t.Fatalf("%+v after %d calls", res, h.push.calls.Load())
+	}
+	h.push.set(func(f *fakePush) { delete(f.errs, "tok-0") })
+	h.clock.add(31 * time.Second)
+	if res, _ := h.send(auth, items(devs[0])...); res[0].Status != StatusOK {
+		t.Fatalf("after the cooldown: %+v", res)
+	}
+}
+
+func TestRepeatedOutagesBackOff(t *testing.T) {
+	h := newHarness(t)
+	id, auth := h.register("A", "a@example.org", "")
+	dev := h.devices(id, 1)[0]
+	down := func(on bool) {
+		h.push.set(func(f *fakePush) {
+			if on {
+				f.errs["tok-0"] = &fcm.Error{Status: 503}
+			} else {
+				delete(f.errs, "tok-0")
+			}
+		})
+	}
+	down(true)
+	for _, want := range []int{60, 120, 240} {
+		res, _ := h.send(auth, items(dev)...)
+		if res[0].Status != StatusFailed || res[0].RetryAfterSeconds != want {
+			t.Fatalf("want a %d s pause: %+v", want, res)
+		}
+		h.clock.add(time.Duration(want+1) * time.Second)
+	}
+	down(false)
+	if res, _ := h.send(auth, items(dev)...); res[0].Status != StatusOK {
+		t.Fatalf("%+v", res)
+	}
+	down(true)
+	h.clock.add(time.Minute)
+	if res, _ := h.send(auth, items(dev)...); res[0].RetryAfterSeconds != 60 {
+		t.Fatalf("a success must reset the backoff: %+v", res)
+	}
+}

@@ -139,7 +139,6 @@ type sendJob struct {
 // batch is what every item of one send shares.
 type batch struct {
 	inst     store.Instance
-	tier     Tier
 	now      time.Time
 	deadline time.Time       // wall clock: items not started by then are deferred
 	db       context.Context // outlives the request, so a reply already sent is still recorded
@@ -176,7 +175,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, inst store.Instanc
 		writeSuspended(w, inst.Status)
 		return
 	}
-	b := &batch{inst: inst, tier: TierFor(inst), now: s.now(), deadline: time.Now().Add(s.batchDeadline), db: context.WithoutCancel(ctx)}
+	b := &batch{inst: inst, now: s.now(), deadline: time.Now().Add(s.batchDeadline), db: context.WithoutCancel(ctx)}
 
 	results := make([]SendResult, len(req.Messages))
 	var jobs []sendJob
@@ -190,6 +189,18 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, inst store.Instanc
 		case len(ct) > MaxCiphertext:
 			results[i].Status = StatusTooLarge
 			continue
+		}
+		// A repeat of a sent id gets its first answer, whatever has changed since: nothing is sent or counted.
+		if item.ID != "" {
+			st, msgID, _, err := s.store.SentByClientID(ctx, inst.ID, item.ID)
+			if err != nil && !errors.Is(err, store.ErrNotFound) {
+				s.internal(w, "send lookup failed", err)
+				return
+			}
+			if err == nil && st == store.SendOK {
+				results[i] = SendResult{MessageID: msgID, Status: StatusOK}
+				continue
+			}
 		}
 
 		h, err := s.store.Handle(ctx, item.Handle)
@@ -276,19 +287,29 @@ func (s *Server) sendOne(ctx context.Context, b *batch, j sendJob) SendResult {
 	if d := s.pausedFor(s.now()); d > 0 {
 		return s.limited(b, d)
 	}
+	if d := s.cooledFor(h.Handle, s.now()); d > 0 {
+		return s.limited(b, d)
+	}
 	if j.item.ID != "" {
-		// A cheap look first, so a repeat spends no rate limit. Reserve decides for real.
-		st, msgID, at, err := s.store.SentByClientID(b.db, inst.ID, j.item.ID)
+		// A cheap look first, so a repeat in flight spends no rate limit. Reserve decides for real.
+		st, _, at, err := s.store.SentByClientID(b.db, inst.ID, j.item.ID)
 		switch {
-		case err == nil && st == store.SendOK:
-			return SendResult{MessageID: msgID, Status: StatusOK}
 		case err == nil && st == store.SendPending && b.now.Sub(at) < store.PendingTimeout:
 			return s.limited(b, InFlightRetry)
 		case err != nil && !errors.Is(err, store.ErrNotFound):
 			return s.storeFailed(b, "send lookup failed", err)
 		}
 	}
-	if ok, d := s.minute.Allow("inst:"+inst.ID, b.tier.PerMinute, b.now); !ok {
+	// The current row, so a quota changed mid-batch applies to what has not gone out yet.
+	cur, err := s.store.Instance(b.db, inst.ID)
+	if err != nil {
+		return s.storeFailed(b, "instance reload failed", err)
+	}
+	if cur.Status != store.StatusActive {
+		b.stop.Store(true)
+		return SendResult{Status: StatusFailed}
+	}
+	if ok, d := s.minute.Allow("inst:"+inst.ID, TierFor(cur).PerMinute, b.now); !ok {
 		return s.limited(b, d)
 	}
 	if ok, d := s.minute.Allow("handle:"+h.Handle, HandlePerMinute, b.now); !ok {
@@ -298,7 +319,7 @@ func (s *Server) sendOne(ctx context.Context, b *batch, j sendJob) SendResult {
 	sum := sha256.Sum256(j.ct)
 	outcome, msgID, err := s.store.Reserve(b.db, store.Reservation{MessageID: "m_" + randomString(16), InstanceID: inst.ID,
 		Handle: h.Handle, ClientID: j.item.ID, At: b.now, Size: len(j.ct), CiphertextSHA256: sum[:],
-		InstancePerDay: b.tier.PerDay, GlobalPerDay: GlobalPerDay, HandlePerDay: HandlePerDay})
+		DayLimit: func(i store.Instance) int { return TierFor(i).PerDay }, GlobalPerDay: GlobalPerDay, HandlePerDay: HandlePerDay})
 	if err != nil {
 		return s.storeFailed(b, "send not reserved", err)
 	}
@@ -326,24 +347,32 @@ func (s *Server) sendOne(ctx context.Context, b *batch, j sendJob) SendResult {
 	if j.item.CollapseKey != "" {
 		collapse = inst.ID + ":" + j.item.CollapseKey
 	}
-	// Not cancelled with the request: FCM bounds each call, and an abandoned call would leave its outcome unknown.
-	err = s.push.Send(b.db, fcm.Message{
+	// Not cancelled with the request, which would leave the outcome unknown, but bounded as a whole.
+	sctx, scancel := context.WithTimeout(b.db, s.sendLimit)
+	err = s.push.Send(sctx, fcm.Message{
 		Token: h.FCMToken,
 		Data: map[string]string{"v": "1", "pushId": inst.ID, "serverName": inst.Name, "messageId": msgID,
 			"ct": base64.StdEncoding.EncodeToString(j.ct)},
 		CollapseKey: collapse, TTL: ttl, AlertTitle: inst.Name, AlertBody: "New alert",
 	})
-	fctx, cancel := context.WithTimeout(b.db, finishSendTimeout)
-	defer cancel()
-	if ferr := s.store.FinishSend(fctx, msgID, err == nil, s.now()); ferr != nil {
+	scancel()
+	if ferr := s.finishSend(b, msgID, err == nil); ferr != nil {
 		s.log.Error("send outcome not recorded", "component", "relay", "push_id", inst.ID, "err", ferr)
+		if err == nil {
+			// Unrecorded, an ok could not be repeated for this id, so the sender must not count on it.
+			b.stop.Store(true)
+			return SendResult{Status: StatusFailed}
+		}
 	}
 	var fe *fcm.Error
 	switch {
 	case err == nil:
+		s.fcmRecovered()
 		return SendResult{MessageID: msgID, Status: StatusOK}
 	case errors.Is(err, fcm.ErrUnregistered):
-		return s.unregistered(fctx, b, h)
+		uctx, ucancel := context.WithTimeout(b.db, finishSendTimeout)
+		defer ucancel()
+		return s.unregistered(uctx, b, h)
 	case errors.Is(err, fcm.ErrInvalidArgument):
 		return SendResult{Status: StatusInvalid}
 	case errors.As(err, &fe) && fe.Status == http.StatusTooManyRequests:
@@ -351,6 +380,8 @@ func (s *Server) sendOne(ctx context.Context, b *batch, j sendJob) SendResult {
 		if d <= 0 {
 			d = FCMThrottleRetry
 		}
+		d = min(d, FCMPauseMax)
+		s.coolHandle(h.Handle, s.now().Add(d), s.now())
 		return s.limited(b, d)
 	case errors.As(err, &fe) && (fe.Status == http.StatusInternalServerError || fe.Status == http.StatusServiceUnavailable):
 		d := s.pauseFCM(s.now(), fe.RetryAfter)
@@ -359,6 +390,24 @@ func (s *Server) sendOne(ctx context.Context, b *batch, j sendJob) SendResult {
 	}
 	s.log.Warn("push not delivered", "component", "relay", "push_id", inst.ID, "err", err)
 	return SendResult{Status: StatusFailed}
+}
+
+// finishSend records FCM's answer on a context of its own, trying a few times before giving up.
+func (s *Server) finishSend(b *batch, msgID string, ok bool) error {
+	ctx, cancel := context.WithTimeout(b.db, finishSendTimeout)
+	defer cancel()
+	var err error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if err = s.store.FinishSend(ctx, msgID, ok, s.now()); err == nil || errors.Is(err, store.ErrNotFound) {
+			return err
+		}
+		select {
+		case <-time.After(time.Duration(attempt) * 100 * time.Millisecond):
+		case <-ctx.Done():
+			return err
+		}
+	}
+	return err
 }
 
 // unregistered revokes a handle FCM no longer knows, unless the app moved it to a new token meanwhile.

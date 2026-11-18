@@ -449,6 +449,9 @@ type Reservation struct {
 	CiphertextSHA256              []byte
 	InstancePerDay, GlobalPerDay  int
 	HandlePerDay                  int
+	// DayLimit, when set, gives the server's daily quota from its row as read in the transaction, so a quota
+	// change made mid-batch applies at once. It replaces InstancePerDay.
+	DayLimit func(Instance) int
 }
 
 // Reserve outcomes.
@@ -472,15 +475,19 @@ func (s *Store) Reserve(ctx context.Context, r Reservation) (Outcome, string, er
 		return 0, "", err
 	}
 	defer tx.Rollback()
-	var status string
-	if err := tx.QueryRowContext(ctx, `SELECT status FROM instances WHERE id = ?`, r.InstanceID).Scan(&status); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return NotActive, "", nil
-		}
+	inst, err := scanInstance(tx.QueryRowContext(ctx, `SELECT `+instanceCols+` FROM instances WHERE id = ?`, r.InstanceID))
+	if errors.Is(err, ErrNotFound) {
+		return NotActive, "", nil
+	}
+	if err != nil {
 		return 0, "", err
 	}
-	if status != StatusActive {
+	if inst.Status != StatusActive {
 		return NotActive, "", nil
+	}
+	dayCap := r.InstancePerDay
+	if r.DayLimit != nil {
+		dayCap = r.DayLimit(inst)
 	}
 	var clientID any
 	if r.ClientID != "" {
@@ -526,7 +533,7 @@ func (s *Store) Reserve(ctx context.Context, r Reservation) (Outcome, string, er
 	switch {
 	case all >= r.GlobalPerDay:
 		return OverGlobalDay, "", nil
-	case mine >= r.InstancePerDay:
+	case mine >= dayCap:
 		return OverInstanceDay, "", nil
 	case toHandle >= r.HandlePerDay:
 		return OverHandleDay, "", nil

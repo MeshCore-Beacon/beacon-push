@@ -68,9 +68,10 @@ const (
 const (
 	SendWorkers       = 8
 	BatchDeadline     = 10 * time.Second
+	SendLimit         = 10 * time.Second // one item's whole FCM send, token refresh included
 	DeferredRetry     = 5 * time.Second  // an item not started before the deadline
 	InFlightRetry     = 30 * time.Second // an id whose earlier send has no answer yet
-	FCMPauseDefault   = time.Minute      // after FCM 500/503 without Retry-After
+	FCMPauseDefault   = time.Minute      // after FCM 500/503 without Retry-After; doubles while outages repeat
 	FCMPauseMax       = time.Hour
 	FCMThrottleRetry  = time.Minute // after FCM 429 without Retry-After
 	finishSendTimeout = 5 * time.Second
@@ -104,16 +105,21 @@ type Server struct {
 	reviewed      sync.Map // server ID -> struct{}, the device-count review notice was sent
 	sendWorkers   int
 	batchDeadline time.Duration
+	sendLimit     time.Duration
 
 	pauseMu     sync.Mutex
 	pausedUntil time.Time // FCM asked every sender to back off until then
+	pauseStreak int       // outages since the last successful send
+
+	coolMu sync.Mutex
+	cool   map[string]time.Time // handle -> FCM throttled it until then
 }
 
 // New builds the relay.
 func New(o Options) *Server {
 	s := &Server{cfg: o.Config, store: o.Store, push: o.Push, mail: o.Mail, now: o.Now, challenge: o.ChallengeClient, log: o.Logger,
 		minute: limit.New(time.Minute), hour: limit.New(time.Hour), harvest: harvestCounter{m: map[string]*harvestSlot{}},
-		sendWorkers: SendWorkers, batchDeadline: BatchDeadline}
+		sendWorkers: SendWorkers, batchDeadline: BatchDeadline, sendLimit: SendLimit, cool: map[string]time.Time{}}
 	if s.now == nil {
 		s.now = time.Now
 	}
@@ -182,18 +188,55 @@ func (s *Server) pausedFor(now time.Time) time.Duration {
 	return s.pausedUntil.Sub(now)
 }
 
-// pauseFCM stops every send for FCM's Retry-After, bounded, and returns the wait it applied.
+// pauseFCM stops every send for FCM's Retry-After, or a default that doubles with each new outage, at most an hour.
+// It returns the wait it applied.
 func (s *Server) pauseFCM(now time.Time, d time.Duration) time.Duration {
-	if d <= 0 {
-		d = FCMPauseDefault
-	}
-	d = min(d, FCMPauseMax)
 	s.pauseMu.Lock()
 	defer s.pauseMu.Unlock()
+	// Sends already in flight when the pause began are the same outage, not a new one.
+	if !now.Before(s.pausedUntil) {
+		s.pauseStreak++
+	}
+	if d <= 0 {
+		d = FCMPauseDefault << min(s.pauseStreak-1, 6)
+	}
+	d = min(d, FCMPauseMax)
 	if until := now.Add(d); until.After(s.pausedUntil) {
 		s.pausedUntil = until
 	}
 	return d
+}
+
+// fcmRecovered resets the outage backoff after a successful send.
+func (s *Server) fcmRecovered() {
+	s.pauseMu.Lock()
+	s.pauseStreak = 0
+	s.pauseMu.Unlock()
+}
+
+// coolHandle keeps sends away from a handle FCM throttled.
+func (s *Server) coolHandle(handle string, until, now time.Time) {
+	s.coolMu.Lock()
+	defer s.coolMu.Unlock()
+	if len(s.cool) > 10_000 {
+		for h, t := range s.cool {
+			if !t.After(now) {
+				delete(s.cool, h)
+			}
+		}
+	}
+	s.cool[handle] = until
+}
+
+// cooledFor is how long a throttled handle still waits.
+func (s *Server) cooledFor(handle string, now time.Time) time.Duration {
+	s.coolMu.Lock()
+	defer s.coolMu.Unlock()
+	until, ok := s.cool[handle]
+	if ok && !until.After(now) {
+		delete(s.cool, handle)
+	}
+	return until.Sub(now)
 }
 
 // clientIP is the caller's address: behind Caddy the last X-Forwarded-For entry across every header line, which is

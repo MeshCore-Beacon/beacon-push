@@ -38,12 +38,16 @@ type fakePush struct {
 	calls atomic.Int64
 }
 
-func (f *fakePush) Send(_ context.Context, m fcm.Message) error {
+func (f *fakePush) Send(ctx context.Context, m fcm.Message) error {
 	f.calls.Add(1)
 	f.mu.Lock()
 	gone, err, delay, hook := f.gone[m.Token], f.errs[m.Token], f.delay, f.hook
 	f.mu.Unlock()
-	time.Sleep(delay)
+	select {
+	case <-time.After(delay):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	if hook != nil {
 		if err := hook(m); err != nil {
 			return err

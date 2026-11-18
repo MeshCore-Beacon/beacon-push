@@ -129,15 +129,25 @@ them again before it goes out.
 ### For the app
 
 **`POST /v1/handles`** with `{"pushId", "platform": "ios"|"android", "fcmToken"}`
-returns `{"handle", "handleSecret"}`. `fcmToken` is up to 4,096 of
-`A-Z a-z 0-9 _ - :`, else `400 bad_token`. The same token on the same server
-keeps its handle and gets a new secret.
+answers `200` with `{"handle", "handleSecret"}`. `fcmToken` is up to 4,096 of
+`A-Z a-z 0-9 _ - :`. The same token on the same server keeps its handle and
+gets a new secret. Errors:
+
+- `400 bad_platform`: `platform` is not `ios` or `android`.
+- `400 bad_token`: `fcmToken` is missing or malformed.
+- `404 unknown_server`: no server has that Push ID.
+- `403 server_unavailable`: the server is suspended or banned.
 
 **`PUT /v1/handles/{handle}`** with `{"handleSecret", "fcmToken"}` moves the
-handle to a refreshed token. It answers `204`.
+handle to a refreshed token. It answers `204`, or `400 bad_token`.
 
 **`DELETE /v1/handles/{handle}`** with `{"handleSecret"}` stops the handle. It
-answers `204`. An unknown handle or a wrong secret gets `404 unknown_handle`.
+answers `204`.
+
+On `PUT` and `DELETE`, an unknown or revoked handle or a wrong secret gets
+`404 unknown_handle`. Each address may create 20 handles an hour and make 60
+updates and deletes an hour; past that it gets `429 rate_limited` with
+`Retry-After`.
 
 ### What reaches the phone
 

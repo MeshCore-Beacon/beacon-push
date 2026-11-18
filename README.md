@@ -108,12 +108,14 @@ servers that do not read the field.
 | `failed` | Transient: FCM unreachable or another FCM error, the token changed while sending, or the relay could not record a send FCM accepted | Retry later; counts an attempt |
 
 When FCM answers 500 or 503, the relay stops sending for everyone for FCM's
-`Retry-After`, at most an hour. Without one it pauses a minute, doubling
-with each new outage up to an hour until a send succeeds again. That item is
+`Retry-After`, at most a day. Without one it pauses a minute, doubling with
+each new outage up to an hour, until a send succeeds after the pause has
+ended. That item is
 `failed` and every item after it is `rate_limited` until the pause ends. An
 FCM 429 makes that item `rate_limited`, for FCM's `Retry-After` (a minute if
-it gives none, at most an hour), and later items for the same device wait out
-the same time without reaching FCM. A message counts against the daily quotas while it is being sent
+it gives none, at most a day), and later items for the same device wait,
+without reaching FCM, until the longest wait FCM has asked for that device
+ends. A message counts against the daily quotas while it is being sent
 and stays counted only if FCM accepts it.
 
 A suspended server gets `403 suspended` for the whole batch, and a banned one

@@ -24,6 +24,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/MeshCore-Beacon/beacon-push/internal/push"
 )
 
 type fcmServer struct {
@@ -122,7 +124,7 @@ func (f *fcmServer) fcm(now func() time.Time) *FCM {
 	return New("my-project", "svc@project.iam", f.srv.URL+"/token", f.srv.URL, f.key, f.srv.Client(), now)
 }
 
-var sampleMsg = Message{Token: "device-token-abc", Data: map[string]string{"v": "1", "ct": "c2VjcmV0"}, CollapseKey: "inst_a:42", TTL: time.Hour,
+var sampleMsg = push.Message{Platform: push.Android, Token: "device-token-abc", Data: map[string]string{"v": "1", "ct": "c2VjcmV0"}, CollapseKey: "inst_a:42", TTL: time.Hour,
 	AlertTitle: "Ottawa Mesh", AlertBody: "New alert"}
 
 func TestFCMSendsTheV1Message(t *testing.T) {
@@ -141,13 +143,8 @@ func TestFCMSendsTheV1Message(t *testing.T) {
 	if android["priority"] != "high" || android["ttl"] != "3600s" || android["collapse_key"] != "inst_a:42" {
 		t.Fatalf("android %+v", android)
 	}
-	apns := m["apns"].(map[string]any)
-	headers := apns["headers"].(map[string]any)
-	aps := apns["payload"].(map[string]any)["aps"].(map[string]any)
-	alert := aps["alert"].(map[string]any)
-	if headers["apns-collapse-id"] != "inst_a:42" || headers["apns-priority"] != "10" || headers["apns-expiration"] != "1794920400" ||
-		aps["mutable-content"] != float64(1) || alert["title"] != "Ottawa Mesh" || alert["body"] != "New alert" {
-		t.Fatalf("apns %+v", apns)
+	if m["apns"] != nil {
+		t.Fatalf("an Android message carries an apns block: %+v", m)
 	}
 }
 
@@ -161,9 +158,6 @@ func TestFCMOmitsAnEmptyCollapseKey(t *testing.T) {
 	m := f.lastSend["message"].(map[string]any)
 	if _, ok := m["android"].(map[string]any)["collapse_key"]; ok {
 		t.Fatal("android collapse_key sent")
-	}
-	if _, ok := m["apns"].(map[string]any)["headers"].(map[string]any)["apns-collapse-id"]; ok {
-		t.Fatal("apns-collapse-id sent")
 	}
 }
 
@@ -194,28 +188,28 @@ func TestFCMUnregisteredToken(t *testing.T) {
 		w.WriteHeader(404)
 		_, _ = w.Write([]byte(`{"error":{"code":404,"status":"NOT_FOUND","details":[{"@type":"x","errorCode":"UNREGISTERED"}]}}`))
 	}
-	if err := f.fcm(nil).Send(context.Background(), sampleMsg); !errors.Is(err, ErrUnregistered) {
+	if err := f.fcm(nil).Send(context.Background(), sampleMsg); !errors.Is(err, push.ErrUnregistered) {
 		t.Fatalf("%v", err)
 	}
 	f.sendReply = func(w http.ResponseWriter, _ int) {
 		w.WriteHeader(400)
 		_, _ = w.Write([]byte(`{"error":{"code":400,"status":"INVALID_ARGUMENT","details":[{"errorCode":"UNREGISTERED"}]}}`))
 	}
-	if err := f.fcm(nil).Send(context.Background(), sampleMsg); !errors.Is(err, ErrUnregistered) {
+	if err := f.fcm(nil).Send(context.Background(), sampleMsg); !errors.Is(err, push.ErrUnregistered) {
 		t.Fatalf("400 unregistered: %v", err)
 	}
 	f.sendReply = func(w http.ResponseWriter, _ int) {
 		w.WriteHeader(400)
 		_, _ = w.Write([]byte(`{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"bad payload"}}`))
 	}
-	if err := f.fcm(nil).Send(context.Background(), sampleMsg); !errors.Is(err, ErrInvalidArgument) || errors.Is(err, ErrUnregistered) {
+	if err := f.fcm(nil).Send(context.Background(), sampleMsg); !errors.Is(err, push.ErrInvalid) || errors.Is(err, push.ErrUnregistered) {
 		t.Fatalf("a plain 400 must be an invalid message, not an unregistered token: %v", err)
 	}
 	f.sendReply = func(w http.ResponseWriter, _ int) {
 		w.WriteHeader(400)
 		_, _ = w.Write([]byte(`{"error":{"code":400,"status":"INVALID_ARGUMENT","details":[{"errorCode":"INVALID_ARGUMENT"}]}}`))
 	}
-	if err := f.fcm(nil).Send(context.Background(), sampleMsg); !errors.Is(err, ErrInvalidArgument) {
+	if err := f.fcm(nil).Send(context.Background(), sampleMsg); !errors.Is(err, push.ErrInvalid) {
 		t.Fatalf("400 INVALID_ARGUMENT detail: %v", err)
 	}
 }
@@ -228,11 +222,13 @@ func TestFCMKeepsTheBackoff(t *testing.T) {
 		body   string
 		want   time.Duration
 		code   string
+		kind   error
 	}{
-		{503, "3600", `{"error":{"code":503,"status":"UNAVAILABLE","details":[{"errorCode":"UNAVAILABLE"}]}}`, time.Hour, "UNAVAILABLE"},
-		{429, "7", `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"errorCode":"QUOTA_EXCEEDED"}]}}`, 7 * time.Second, "QUOTA_EXCEEDED"},
-		{500, "", `{"error":{"code":500,"status":"INTERNAL"}}`, 0, "INTERNAL"},
-		{503, "Wed, 18 Nov 2026 12:00:30 GMT", ``, 30 * time.Second, ""},
+		{503, "3600", `{"error":{"code":503,"status":"UNAVAILABLE","details":[{"errorCode":"UNAVAILABLE"}]}}`, time.Hour, "UNAVAILABLE", push.ErrUnavailable},
+		{429, "7", `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"errorCode":"QUOTA_EXCEEDED"}]}}`, 7 * time.Second, "QUOTA_EXCEEDED", push.ErrThrottled},
+		{500, "", `{"error":{"code":500,"status":"INTERNAL"}}`, 0, "INTERNAL", push.ErrUnavailable},
+		{503, "Wed, 18 Nov 2026 12:00:30 GMT", ``, 30 * time.Second, "", push.ErrUnavailable},
+		{502, "", ``, 0, "", nil},
 	} {
 		f.sendReply = func(w http.ResponseWriter, _ int) {
 			if c.header != "" {
@@ -243,11 +239,11 @@ func TestFCMKeepsTheBackoff(t *testing.T) {
 		}
 		now := func() time.Time { return time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC) }
 		err := f.fcm(now).Send(context.Background(), sampleMsg)
-		var fe *Error
-		if !errors.As(err, &fe) || fe.Status != c.status || fe.RetryAfter != c.want || fe.Code != c.code {
+		var fe *push.Error
+		if !errors.As(err, &fe) || fe.Provider != "fcm" || fe.Status != c.status || fe.RetryAfter != c.want || fe.Code != c.code || fe.Kind != c.kind {
 			t.Errorf("%d %q: %#v", c.status, c.header, err)
 		}
-		if errors.Is(err, ErrInvalidArgument) || errors.Is(err, ErrUnregistered) {
+		if errors.Is(err, push.ErrInvalid) || errors.Is(err, push.ErrUnregistered) {
 			t.Errorf("%d: %v", c.status, err)
 		}
 	}
@@ -269,8 +265,8 @@ func TestFCMRetriesOnceAfterAStaleAccessToken(t *testing.T) {
 		t.Fatalf("token hits %d, send hits %d, auth %s", f.tokenHits, f.sendHits, f.lastAuth)
 	}
 	f.sendReply = func(w http.ResponseWriter, _ int) { w.WriteHeader(401) }
-	if err := f.fcm(nil).Send(context.Background(), sampleMsg); err == nil {
-		t.Fatal("a second 401 must fail")
+	if err := f.fcm(nil).Send(context.Background(), sampleMsg); !errors.Is(err, push.ErrAuth) {
+		t.Fatalf("a second 401 must fail as an auth error: %v", err)
 	}
 }
 

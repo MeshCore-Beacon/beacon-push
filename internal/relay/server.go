@@ -24,9 +24,9 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/MeshCore-Beacon/beacon-push/internal/config"
-	"github.com/MeshCore-Beacon/beacon-push/internal/fcm"
 	"github.com/MeshCore-Beacon/beacon-push/internal/limit"
 	"github.com/MeshCore-Beacon/beacon-push/internal/mail"
+	"github.com/MeshCore-Beacon/beacon-push/internal/push"
 	"github.com/MeshCore-Beacon/beacon-push/internal/store"
 )
 
@@ -64,25 +64,25 @@ const (
 	harvestForeignMax = 50 // another server's live handles in an hour, whatever the ratio
 )
 
-// Send timing. A batch answers within about BatchDeadline plus one FCM call (10 s).
+// Send timing. A batch answers within about BatchDeadline plus one provider call (10 s).
 const (
-	SendWorkers       = 8
-	BatchDeadline     = 10 * time.Second
-	SendLimit         = 10 * time.Second // one item's whole FCM send, token refresh included
-	DeferredRetry     = 5 * time.Second  // an item not started before the deadline
-	InFlightRetry     = 30 * time.Second // an id whose earlier send has no answer yet
-	FCMPauseDefault   = time.Minute      // after FCM 500/503 without Retry-After; doubles while outages repeat
-	FCMPauseMax       = time.Hour        // cap on the computed backoff
-	FCMWaitMax        = 24 * time.Hour   // sanity cap on a Retry-After FCM sends
-	FCMThrottleRetry  = time.Minute      // after FCM 429 without Retry-After
-	finishSendTimeout = 5 * time.Second
+	SendWorkers        = 8
+	BatchDeadline      = 10 * time.Second
+	SendLimit          = 10 * time.Second // one item's whole provider send, token refresh included
+	DeferredRetry      = 5 * time.Second  // an item not started before the deadline
+	InFlightRetry      = 30 * time.Second // an id whose earlier send has no answer yet
+	OutagePauseDefault = time.Minute      // after a provider outage without Retry-After; doubles while outages repeat
+	OutagePauseMax     = time.Hour        // cap on the computed backoff
+	ProviderWaitMax    = 24 * time.Hour   // sanity cap on a Retry-After a provider sends
+	ThrottleRetry      = time.Minute      // after a device throttle without Retry-After
+	finishSendTimeout  = 5 * time.Second
 )
 
 // Options builds a Server. Now, ChallengeClient and Logger are optional.
 type Options struct {
 	Config          config.Config
 	Store           *store.Store
-	Push            fcm.Sender
+	Push            push.Sender
 	Mail            mail.Sender
 	Now             func() time.Time
 	ChallengeClient *http.Client
@@ -93,7 +93,7 @@ type Options struct {
 type Server struct {
 	cfg       config.Config
 	store     *store.Store
-	push      fcm.Sender
+	push      push.Sender
 	mail      mail.Sender
 	now       func() time.Time
 	challenge *http.Client
@@ -108,19 +108,24 @@ type Server struct {
 	batchDeadline time.Duration
 	sendLimit     time.Duration
 
-	pauseMu     sync.Mutex
-	pausedUntil time.Time // FCM asked every sender to back off until then
-	pauseStreak int       // outages since the last successful send
+	pauseMu sync.Mutex
+	pauses  map[string]*outage // provider -> its outage backoff
 
 	coolMu sync.Mutex
-	cool   map[string]time.Time // handle -> FCM throttled it until then
+	cool   map[string]time.Time // handle -> its provider throttled it until then
+}
+
+// outage is one provider's backoff: every send through it waits until pausedUntil.
+type outage struct {
+	pausedUntil time.Time
+	streak      int // outages since the last successful send
 }
 
 // New builds the relay.
 func New(o Options) *Server {
 	s := &Server{cfg: o.Config, store: o.Store, push: o.Push, mail: o.Mail, now: o.Now, challenge: o.ChallengeClient, log: o.Logger,
 		minute: limit.New(time.Minute), hour: limit.New(time.Hour), harvest: harvestCounter{m: map[string]*harvestSlot{}},
-		sendWorkers: SendWorkers, batchDeadline: BatchDeadline, sendLimit: SendLimit, cool: map[string]time.Time{}}
+		sendWorkers: SendWorkers, batchDeadline: BatchDeadline, sendLimit: SendLimit, cool: map[string]time.Time{}, pauses: map[string]*outage{}}
 	if s.now == nil {
 		s.now = time.Now
 	}
@@ -182,44 +187,54 @@ func (s *Server) lockInstance(ctx context.Context, id string) (func(), error) {
 	}
 }
 
-// pausedFor is how long the relay still waits after FCM asked it to back off.
-func (s *Server) pausedFor(now time.Time) time.Duration {
-	s.pauseMu.Lock()
-	defer s.pauseMu.Unlock()
-	return s.pausedUntil.Sub(now)
+func (s *Server) outageOf(provider string) *outage {
+	o := s.pauses[provider]
+	if o == nil {
+		o = &outage{}
+		s.pauses[provider] = o
+	}
+	return o
 }
 
-// pauseFCM stops every send for FCM's Retry-After (at most a day), or a default that doubles with each new outage,
-// at most an hour. It returns how long the pause now lasts.
-func (s *Server) pauseFCM(now time.Time, d time.Duration) time.Duration {
+// pausedFor is how long sends through the provider still wait after it asked the relay to back off.
+func (s *Server) pausedFor(provider string, now time.Time) time.Duration {
 	s.pauseMu.Lock()
 	defer s.pauseMu.Unlock()
+	return s.outageOf(provider).pausedUntil.Sub(now)
+}
+
+// pauseProvider stops every send through the provider for its Retry-After (at most a day), or a default that doubles
+// with each new outage, at most an hour. It returns how long the pause now lasts.
+func (s *Server) pauseProvider(provider string, now time.Time, d time.Duration) time.Duration {
+	s.pauseMu.Lock()
+	defer s.pauseMu.Unlock()
+	o := s.outageOf(provider)
 	// Sends already in flight when the pause began are the same outage, not a new one.
-	if !now.Before(s.pausedUntil) {
-		s.pauseStreak++
+	if !now.Before(o.pausedUntil) {
+		o.streak++
 	}
 	if d > 0 {
-		d = min(d, FCMWaitMax)
+		d = min(d, ProviderWaitMax)
 	} else {
-		d = min(FCMPauseDefault<<min(max(s.pauseStreak-1, 0), 6), FCMPauseMax)
+		d = min(OutagePauseDefault<<min(max(o.streak-1, 0), 6), OutagePauseMax)
 	}
-	if until := now.Add(d); until.After(s.pausedUntil) {
-		s.pausedUntil = until
+	if until := now.Add(d); until.After(o.pausedUntil) {
+		o.pausedUntil = until
 	}
-	return s.pausedUntil.Sub(now)
+	return o.pausedUntil.Sub(now)
 }
 
-// fcmRecovered resets the outage backoff after a successful send, unless a pause is still on: a send that was in
-// flight when FCM went down says nothing about the outage being over.
-func (s *Server) fcmRecovered(now time.Time) {
+// providerRecovered resets the provider's backoff after a successful send, unless a pause is still on: a send that
+// was in flight when it went down says nothing about the outage being over.
+func (s *Server) providerRecovered(provider string, now time.Time) {
 	s.pauseMu.Lock()
-	if !now.Before(s.pausedUntil) {
-		s.pauseStreak = 0
+	if o := s.outageOf(provider); !now.Before(o.pausedUntil) {
+		o.streak = 0
 	}
 	s.pauseMu.Unlock()
 }
 
-// coolHandle keeps sends away from a handle FCM throttled, keeping the later expiry, which it returns.
+// coolHandle keeps sends away from a handle its provider throttled, keeping the later expiry, which it returns.
 func (s *Server) coolHandle(handle string, until, now time.Time) time.Time {
 	s.coolMu.Lock()
 	defer s.coolMu.Unlock()

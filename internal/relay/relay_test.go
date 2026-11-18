@@ -22,23 +22,23 @@ import (
 	"time"
 
 	"github.com/MeshCore-Beacon/beacon-push/internal/config"
-	"github.com/MeshCore-Beacon/beacon-push/internal/fcm"
 	"github.com/MeshCore-Beacon/beacon-push/internal/mail"
+	"github.com/MeshCore-Beacon/beacon-push/internal/push"
 	"github.com/MeshCore-Beacon/beacon-push/internal/store"
 )
 
-// fakePush records what would go to FCM. It can refuse a token, answer an error, wait, or run a hook first.
+// fakePush records what would go to a push provider. It can refuse a token, answer an error, wait, or run a hook first.
 type fakePush struct {
 	mu    sync.Mutex
-	sent  []fcm.Message
+	sent  []push.Message
 	gone  map[string]bool
 	errs  map[string]error
 	delay time.Duration
-	hook  func(fcm.Message) error
+	hook  func(push.Message) error
 	calls atomic.Int64
 }
 
-func (f *fakePush) Send(ctx context.Context, m fcm.Message) error {
+func (f *fakePush) Send(ctx context.Context, m push.Message) error {
 	f.calls.Add(1)
 	f.mu.Lock()
 	gone, err, delay, hook := f.gone[m.Token], f.errs[m.Token], f.delay, f.hook
@@ -54,7 +54,7 @@ func (f *fakePush) Send(ctx context.Context, m fcm.Message) error {
 		}
 	}
 	if gone {
-		return fcm.ErrUnregistered
+		return push.ErrUnregistered
 	}
 	if err != nil {
 		return err
@@ -71,10 +71,10 @@ func (f *fakePush) set(fn func(f *fakePush)) {
 	f.mu.Unlock()
 }
 
-func (f *fakePush) messages() []fcm.Message {
+func (f *fakePush) messages() []push.Message {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]fcm.Message(nil), f.sent...)
+	return append([]push.Message(nil), f.sent...)
 }
 
 type clock struct {

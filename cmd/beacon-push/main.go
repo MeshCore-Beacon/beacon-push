@@ -23,6 +23,7 @@ import (
 	"github.com/MeshCore-Beacon/beacon-push/internal/config"
 	"github.com/MeshCore-Beacon/beacon-push/internal/fcm"
 	"github.com/MeshCore-Beacon/beacon-push/internal/mail"
+	"github.com/MeshCore-Beacon/beacon-push/internal/push"
 	"github.com/MeshCore-Beacon/beacon-push/internal/relay"
 	"github.com/MeshCore-Beacon/beacon-push/internal/store"
 )
@@ -66,7 +67,7 @@ func serve() error {
 	}
 	defer st.Close()
 
-	var push fcm.Sender = fcm.Log{}
+	var sender push.Sender = push.Log{}
 	var mailer mail.Sender = mail.Log{}
 	if cfg.DevMode {
 		slog.Warn("dev mode: mail and pushes are logged, not sent, and the domain check may reach private addresses", "component", "startup")
@@ -75,11 +76,11 @@ func serve() error {
 		if err != nil {
 			return err
 		}
-		push = f
+		sender = push.Router{IOS: f, Android: f}
 		mailer = mail.NewSMTP(cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPUsername, cfg.SMTPPassword, cfg.SMTPFrom, cfg.SMTPStartTLS)
 	}
 
-	srv := relay.New(relay.Options{Config: cfg, Store: st, Push: push, Mail: mailer})
+	srv := relay.New(relay.Options{Config: cfg, Store: st, Push: sender, Mail: mailer})
 	go srv.RunMaintenance(ctx)
 
 	hs := &http.Server{Addr: cfg.ListenAddr, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second,

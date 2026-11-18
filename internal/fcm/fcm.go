@@ -1,8 +1,7 @@
 // Copyright 2026 Beacon Contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Package fcm sends data messages through Firebase Cloud Messaging's HTTP v1 API, which delivers to Android and,
-// through the APNs key uploaded to Firebase, to iOS.
+// Package fcm sends data messages to Android devices through Firebase Cloud Messaging's HTTP v1 API.
 package fcm
 
 import (
@@ -19,7 +18,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -27,57 +25,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/MeshCore-Beacon/beacon-push/internal/push"
 )
-
-// Message is one notification for one device. Data is delivered as is; the app decrypts what it carries. On iOS the
-// alert text is a placeholder the app's Notification Service Extension replaces after decrypting.
-type Message struct {
-	Token       string
-	Data        map[string]string
-	CollapseKey string // at most 64 bytes; empty means none
-	TTL         time.Duration
-	AlertTitle  string // iOS placeholder
-	AlertBody   string // iOS placeholder
-}
-
-// ErrUnregistered means the push service no longer knows the token: the handle should go.
-var ErrUnregistered = errors.New("fcm: token unregistered")
-
-// ErrInvalidArgument means FCM refused the message itself (400 INVALID_ARGUMENT): sending it again cannot work.
-var ErrInvalidArgument = errors.New("fcm: message refused as invalid")
-
-// Error is any other refusal from FCM. It keeps the status, the error code and the asked-for wait, never the token
-// or the reply body.
-type Error struct {
-	Status     int
-	Code       string        // FCM errorCode, else the Google status; may be empty
-	RetryAfter time.Duration // 0 when FCM gave none
-}
-
-func (e *Error) Error() string {
-	if e.Code != "" {
-		return fmt.Sprintf("fcm answered %d %s", e.Status, e.Code)
-	}
-	return fmt.Sprintf("fcm answered %d", e.Status)
-}
-
-// Is lets errors.Is(err, ErrInvalidArgument) match a 400 INVALID_ARGUMENT.
-func (e *Error) Is(target error) bool {
-	return target == ErrInvalidArgument && e.Status == http.StatusBadRequest && e.Code == "INVALID_ARGUMENT"
-}
-
-// Sender sends one message.
-type Sender interface {
-	Send(ctx context.Context, m Message) error
-}
-
-// Log is a Sender for dev mode: it logs that a message would go out, without the token or the data.
-type Log struct{}
-
-func (Log) Send(_ context.Context, m Message) error {
-	slog.Info("push (dev mode, not sent)", "component", "fcm", "data_keys", len(m.Data), "collapse_key", m.CollapseKey)
-	return nil
-}
 
 const (
 	scope          = "https://www.googleapis.com/auth/firebase.messaging"
@@ -262,35 +212,19 @@ func (f *FCM) forgetToken() {
 	f.mu.Unlock()
 }
 
-// body is the v1 message: data-only and high priority on Android; on iOS a placeholder alert with mutable-content so
-// the Notification Service Extension runs and replaces it with the decrypted text.
-func (f *FCM) body(m Message) []byte {
-	ttl := int64(m.TTL / time.Second)
-	android := map[string]any{"priority": "high", "ttl": strconv.FormatInt(ttl, 10) + "s"}
-	headers := map[string]string{"apns-priority": "10", "apns-push-type": "alert",
-		"apns-expiration": strconv.FormatInt(f.now().Add(m.TTL).Unix(), 10)}
+// body is the v1 message: data-only and high priority.
+func (f *FCM) body(m push.Message) []byte {
+	android := map[string]any{"priority": "high", "ttl": strconv.FormatInt(int64(m.TTL/time.Second), 10) + "s"}
 	if m.CollapseKey != "" {
 		android["collapse_key"] = m.CollapseKey
-		headers["apns-collapse-id"] = m.CollapseKey
 	}
-	b, _ := json.Marshal(map[string]any{"message": map[string]any{
-		"token":   m.Token,
-		"data":    m.Data,
-		"android": android,
-		"apns": map[string]any{
-			"headers": headers,
-			"payload": map[string]any{"aps": map[string]any{
-				"alert":           map[string]string{"title": m.AlertTitle, "body": m.AlertBody},
-				"mutable-content": 1,
-			}},
-		},
-	}})
+	b, _ := json.Marshal(map[string]any{"message": map[string]any{"token": m.Token, "data": m.Data, "android": android}})
 	return b
 }
 
-// Send posts one message. ErrUnregistered when Google says the device token is gone, ErrInvalidArgument when it refuses
-// the message, otherwise an *Error for an FCM answer or a plain error when FCM could not be reached.
-func (f *FCM) Send(ctx context.Context, m Message) error {
+// Send posts one message. push.ErrUnregistered when Google says the device token is gone, otherwise a *push.Error for
+// an FCM answer or a plain error when FCM could not be reached.
+func (f *FCM) Send(ctx context.Context, m push.Message) error {
 	ctx, cancel := context.WithTimeout(ctx, f.sendLimit)
 	defer cancel()
 	body := f.body(m)
@@ -324,12 +258,25 @@ func (f *FCM) Send(ctx context.Context, m Message) error {
 		}
 		code, status := errorCode(reply)
 		if code == "UNREGISTERED" || (resp.StatusCode == http.StatusNotFound && (status == "NOT_FOUND" || status == "UNREGISTERED")) {
-			return ErrUnregistered
+			return push.ErrUnregistered
 		}
 		if code == "" {
 			code = status
 		}
-		return &Error{Status: resp.StatusCode, Code: code, RetryAfter: retryAfter(resp.Header.Get("Retry-After"), f.now())}
+		e := &push.Error{Provider: push.FCM, Status: resp.StatusCode, Code: code, RetryAfter: retryAfter(resp.Header.Get("Retry-After"), f.now())}
+		switch resp.StatusCode {
+		case http.StatusBadRequest:
+			if code == "INVALID_ARGUMENT" {
+				e.Kind = push.ErrInvalid
+			}
+		case http.StatusUnauthorized, http.StatusForbidden:
+			e.Kind = push.ErrAuth
+		case http.StatusTooManyRequests:
+			e.Kind = push.ErrThrottled
+		case http.StatusInternalServerError, http.StatusServiceUnavailable:
+			e.Kind = push.ErrUnavailable
+		}
+		return e
 	}
 }
 

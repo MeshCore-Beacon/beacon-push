@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MeshCore-Beacon/beacon-push/internal/fcm"
+	"github.com/MeshCore-Beacon/beacon-push/internal/push"
 	"github.com/MeshCore-Beacon/beacon-push/internal/store"
 )
 
@@ -163,7 +163,7 @@ func TestIdempotencyKey(t *testing.T) {
 	}
 
 	// A failed try is sent again on repeat.
-	h.push.set(func(f *fakePush) { f.errs["tok-1"] = &fcm.Error{Status: 502} })
+	h.push.set(func(f *fakePush) { f.errs["tok-1"] = &push.Error{Provider: push.FCM, Status: 502} })
 	item = SendItem{Handle: devs[1], Ciphertext: ct, ID: "1235:x"}
 	if res, _ := h.send(auth, item); res[0].Status != StatusFailed {
 		t.Fatalf("%+v", res)
@@ -244,7 +244,7 @@ func TestSendIsCountedWhenTheClientLeaves(t *testing.T) {
 	devs := h.devices(id, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	h.push.set(func(f *fakePush) {
-		f.hook = func(fcm.Message) error {
+		f.hook = func(push.Message) error {
 			cancel()
 			time.Sleep(200 * time.Millisecond) // the relay notices the closed connection
 			return nil
@@ -283,7 +283,7 @@ func TestGlobalQuotaHoldsAcrossServers(t *testing.T) {
 	var mu sync.Mutex
 	arrived := 0
 	h.push.set(func(f *fakePush) {
-		f.hook = func(fcm.Message) error {
+		f.hook = func(push.Message) error {
 			mu.Lock()
 			arrived++
 			mu.Unlock()
@@ -364,11 +364,11 @@ func TestStaleUnregisteredKeepsARefreshedHandle(t *testing.T) {
 	id, auth := h.register("A", "a@example.org", "")
 	dev := h.handle(id, "tok-a").Handle
 	h.push.set(func(f *fakePush) {
-		f.hook = func(m fcm.Message) error {
+		f.hook = func(m push.Message) error {
 			if err := h.store.RefreshHandleToken(ctx, dev, id, "tok-b", h.clock.now()); err != nil {
 				t.Error(err)
 			}
-			return fcm.ErrUnregistered
+			return push.ErrUnregistered
 		}
 	})
 	if res, _ := h.send(auth, items(dev)...); res[0].Status != StatusFailed {
@@ -384,7 +384,9 @@ func TestFCMOutagePausesTheRelay(t *testing.T) {
 	id, auth := h.register("A", "a@example.org", "")
 	devs := h.devices(id, 4)
 	h.relay.sendWorkers = 1
-	h.push.set(func(f *fakePush) { f.errs["tok-0"] = &fcm.Error{Status: 503, RetryAfter: 120 * time.Second} })
+	h.push.set(func(f *fakePush) {
+		f.errs["tok-0"] = &push.Error{Provider: push.FCM, Status: 503, RetryAfter: 120 * time.Second, Kind: push.ErrUnavailable}
+	})
 	res, resp := h.send(auth, items(devs[:3]...)...)
 	if res[0].Status != StatusFailed || res[0].RetryAfterSeconds != 120 || h.push.calls.Load() != 1 {
 		t.Fatalf("%+v after %d calls", res, h.push.calls.Load())
@@ -407,12 +409,16 @@ func TestFCMOutagePausesTheRelay(t *testing.T) {
 	}
 
 	// No Retry-After pauses a minute; FCM's own wait is kept even past the hour the backoff stops at.
-	h.push.set(func(f *fakePush) { f.errs["tok-0"] = &fcm.Error{Status: 500} })
+	h.push.set(func(f *fakePush) {
+		f.errs["tok-0"] = &push.Error{Provider: push.FCM, Status: 500, Kind: push.ErrUnavailable}
+	})
 	if res, _ := h.send(auth, items(devs[0])...); res[0].RetryAfterSeconds != 60 {
 		t.Fatalf("%+v", res)
 	}
 	h.clock.add(61 * time.Second)
-	h.push.set(func(f *fakePush) { f.errs["tok-0"] = &fcm.Error{Status: 503, RetryAfter: 5 * time.Hour} })
+	h.push.set(func(f *fakePush) {
+		f.errs["tok-0"] = &push.Error{Provider: push.FCM, Status: 503, RetryAfter: 5 * time.Hour, Kind: push.ErrUnavailable}
+	})
 	if res, _ := h.send(auth, items(devs[0])...); res[0].RetryAfterSeconds != 5*3600 {
 		t.Fatalf("%+v", res)
 	}
@@ -422,7 +428,9 @@ func TestFCMThrottleLimitsOnlyThatItem(t *testing.T) {
 	h := newHarness(t)
 	id, auth := h.register("A", "a@example.org", "")
 	devs := h.devices(id, 2)
-	h.push.set(func(f *fakePush) { f.errs["tok-0"] = &fcm.Error{Status: 429} })
+	h.push.set(func(f *fakePush) {
+		f.errs["tok-0"] = &push.Error{Provider: push.FCM, Status: 429, Kind: push.ErrThrottled}
+	})
 	res, _ := h.send(auth, items(devs...)...)
 	if res[0].Status != StatusRateLimited || res[0].RetryAfterSeconds != 60 || res[1].Status != StatusOK {
 		t.Fatalf("%+v", res)
@@ -436,7 +444,7 @@ func TestFCMInvalidArgumentIsInvalid(t *testing.T) {
 	h := newHarness(t)
 	id, auth := h.register("A", "a@example.org", "")
 	dev := h.handle(id, "tok").Handle
-	h.push.set(func(f *fakePush) { f.errs["tok"] = fmt.Errorf("wrapped: %w", fcm.ErrInvalidArgument) })
+	h.push.set(func(f *fakePush) { f.errs["tok"] = fmt.Errorf("wrapped: %w", push.ErrInvalid) })
 	if res, _ := h.send(auth, items(dev)...); res[0].Status != StatusInvalid {
 		t.Fatalf("%+v", res)
 	}
@@ -492,7 +500,7 @@ func TestSentIDAnswersOKWhateverElseChanged(t *testing.T) {
 		return u[0]
 	}
 	before := usage()
-	h.relay.pauseFCM(h.clock.now(), time.Hour)
+	h.relay.pauseProvider(push.FCM, h.clock.now(), time.Hour)
 	if res, _ := h.send(auth, item); res[0].Status != StatusOK || res[0].MessageID != first[0].MessageID {
 		t.Fatalf("repeat during a pause: %+v", res)
 	}
@@ -515,7 +523,7 @@ func TestQuotaChangeAppliesMidBatch(t *testing.T) {
 	lower := func(perMinute, perDay int) {
 		var once sync.Once
 		h.push.set(func(f *fakePush) {
-			f.hook = func(fcm.Message) error {
+			f.hook = func(push.Message) error {
 				once.Do(func() {
 					if err := h.store.SetQuota(context.Background(), id, perMinute, perDay); err != nil {
 						t.Error(err)
@@ -544,7 +552,9 @@ func TestFCMThrottleCoolsTheDevice(t *testing.T) {
 	id, auth := h.register("A", "a@example.org", "")
 	devs := h.devices(id, 2)
 	h.relay.sendWorkers = 1
-	h.push.set(func(f *fakePush) { f.errs["tok-0"] = &fcm.Error{Status: 429, RetryAfter: 30 * time.Second} })
+	h.push.set(func(f *fakePush) {
+		f.errs["tok-0"] = &push.Error{Provider: push.FCM, Status: 429, RetryAfter: 30 * time.Second, Kind: push.ErrThrottled}
+	})
 	res, _ := h.send(auth, items(devs[0], devs[0], devs[1])...)
 	if res[0].Status != StatusRateLimited || res[0].RetryAfterSeconds != 30 || res[1].Status != StatusRateLimited ||
 		res[1].RetryAfterSeconds != 30 || res[2].Status != StatusOK || h.push.calls.Load() != 2 {
@@ -564,7 +574,7 @@ func TestRepeatedOutagesBackOff(t *testing.T) {
 	down := func(on bool) {
 		h.push.set(func(f *fakePush) {
 			if on {
-				f.errs["tok-0"] = &fcm.Error{Status: 503}
+				f.errs["tok-0"] = &push.Error{Provider: push.FCM, Status: 503, Kind: push.ErrUnavailable}
 			} else {
 				delete(f.errs, "tok-0")
 			}
@@ -593,17 +603,17 @@ func TestSuccessDuringAPauseKeepsItAndCannotPanic(t *testing.T) {
 	h := newHarness(t)
 	now := h.clock.now()
 	// 503, success, 503 from three sends that were in flight together.
-	h.relay.pauseFCM(now, 0)
-	h.relay.fcmRecovered(now)
-	if d := h.relay.pauseFCM(now, 0); d != FCMPauseDefault {
+	h.relay.pauseProvider(push.FCM, now, 0)
+	h.relay.providerRecovered(push.FCM, now)
+	if d := h.relay.pauseProvider(push.FCM, now, 0); d != OutagePauseDefault {
 		t.Fatalf("pause %s", d)
 	}
-	if d := h.relay.pausedFor(now); d != FCMPauseDefault {
+	if d := h.relay.pausedFor(push.FCM, now); d != OutagePauseDefault {
 		t.Fatalf("a success cleared an outstanding pause: %s left", d)
 	}
 	// The outage goes on after the pause: the backoff did not restart.
-	h.clock.add(FCMPauseDefault)
-	if d := h.relay.pauseFCM(h.clock.now(), 0); d != 2*FCMPauseDefault {
+	h.clock.add(OutagePauseDefault)
+	if d := h.relay.pauseProvider(push.FCM, h.clock.now(), 0); d != 2*OutagePauseDefault {
 		t.Fatalf("next pause %s", d)
 	}
 }
@@ -613,7 +623,7 @@ func TestWorkerPanicFailsOnlyThatItem(t *testing.T) {
 	id, auth := h.register("A", "a@example.org", "")
 	devs := h.devices(id, 2)
 	h.push.set(func(f *fakePush) {
-		f.hook = func(m fcm.Message) error {
+		f.hook = func(m push.Message) error {
 			if m.Token == "tok-0" {
 				panic("boom")
 			}
@@ -669,7 +679,9 @@ func TestFCMThrottleKeepsALongWait(t *testing.T) {
 	h := newHarness(t)
 	id, auth := h.register("A", "a@example.org", "")
 	dev := h.devices(id, 1)[0]
-	h.push.set(func(f *fakePush) { f.errs["tok-0"] = &fcm.Error{Status: 429, RetryAfter: 2 * time.Hour} })
+	h.push.set(func(f *fakePush) {
+		f.errs["tok-0"] = &push.Error{Provider: push.FCM, Status: 429, RetryAfter: 2 * time.Hour, Kind: push.ErrThrottled}
+	})
 	if res, _ := h.send(auth, items(dev)...); res[0].RetryAfterSeconds != 7200 {
 		t.Fatalf("%+v", res)
 	}

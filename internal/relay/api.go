@@ -15,7 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/MeshCore-Beacon/beacon-push/internal/fcm"
+	"github.com/MeshCore-Beacon/beacon-push/internal/push"
 	"github.com/MeshCore-Beacon/beacon-push/internal/store"
 )
 
@@ -88,7 +88,7 @@ type SendItem struct {
 type SendResult struct {
 	MessageID         string `json:"messageId,omitempty"`
 	Status            string `json:"status" enums:"ok,rate_limited,invalid_handle,too_large,invalid,failed"`
-	RetryAfterSeconds int    `json:"retryAfterSeconds,omitempty"` // on rate_limited, and failed after an FCM outage
+	RetryAfterSeconds int    `json:"retryAfterSeconds,omitempty"` // on rate_limited, and failed after a provider outage
 }
 
 // Send statuses.
@@ -129,7 +129,7 @@ func writeSuspended(w http.ResponseWriter, status string) {
 	writeError(w, http.StatusForbidden, "suspended", "This server is suspended from the push relay. Contact abuse@meshcorebeacon.ca.")
 }
 
-// sendJob is an item that passed the checks and is ready to go to FCM.
+// sendJob is an item that passed the checks and is ready to go to its push provider.
 type sendJob struct {
 	i      int
 	item   SendItem
@@ -287,7 +287,7 @@ func (s *Server) sendSafely(ctx context.Context, b *batch, j sendJob) (res SendR
 	return s.sendOne(ctx, b, j)
 }
 
-// sendOne reserves quota for one item, hands it to FCM and records the answer.
+// sendOne reserves quota for one item, hands it to the push provider and records the answer.
 func (s *Server) sendOne(ctx context.Context, b *batch, j sendJob) SendResult {
 	inst, h := b.inst, j.handle
 	if b.stop.Load() {
@@ -309,7 +309,8 @@ func (s *Server) sendOne(ctx context.Context, b *batch, j sendJob) SendResult {
 	if time.Now().After(b.deadline) || ctx.Err() != nil {
 		return s.limited(b, DeferredRetry)
 	}
-	if d := s.pausedFor(s.now()); d > 0 {
+	provider := push.Provider(h.Platform)
+	if d := s.pausedFor(provider, s.now()); d > 0 {
 		return s.limited(b, d)
 	}
 	if d := s.cooledFor(h.Handle, s.now()); d > 0 {
@@ -364,8 +365,8 @@ func (s *Server) sendOne(ctx context.Context, b *batch, j sendJob) SendResult {
 	}
 	// Not cancelled with the request, which would leave the outcome unknown, but bounded as a whole.
 	sctx, scancel := context.WithTimeout(b.db, s.sendLimit)
-	err = s.push.Send(sctx, fcm.Message{
-		Token: h.FCMToken,
+	err = s.push.Send(sctx, push.Message{
+		Platform: h.Platform, Token: h.FCMToken,
 		Data: map[string]string{"v": "1", "pushId": inst.ID, "serverName": inst.Name, "messageId": msgID,
 			"ct": base64.StdEncoding.EncodeToString(j.ct)},
 		CollapseKey: collapse, TTL: ttl, AlertTitle: inst.Name, AlertBody: "New alert",
@@ -379,34 +380,48 @@ func (s *Server) sendOne(ctx context.Context, b *batch, j sendJob) SendResult {
 			return SendResult{Status: StatusFailed}
 		}
 	}
-	var fe *fcm.Error
+	var pe *push.Error
+	errors.As(err, &pe)
 	switch {
 	case err == nil:
-		s.fcmRecovered(s.now())
+		s.providerRecovered(provider, s.now())
 		return SendResult{MessageID: msgID, Status: StatusOK}
-	case errors.Is(err, fcm.ErrUnregistered):
+	case errors.Is(err, push.ErrUnregistered):
 		uctx, ucancel := context.WithTimeout(b.db, finishSendTimeout)
 		defer ucancel()
 		return s.unregistered(uctx, b, h)
-	case errors.Is(err, fcm.ErrInvalidArgument):
+	case errors.Is(err, push.ErrInvalid):
 		return SendResult{Status: StatusInvalid}
-	case errors.As(err, &fe) && fe.Status == http.StatusTooManyRequests:
-		d := min(fe.RetryAfter, FCMWaitMax)
+	case errors.Is(err, push.ErrTooLarge):
+		return SendResult{Status: StatusTooLarge}
+	case errors.Is(err, push.ErrThrottled):
+		var d time.Duration
+		if pe != nil {
+			d = min(pe.RetryAfter, ProviderWaitMax)
+		}
 		if d <= 0 {
-			d = FCMThrottleRetry
+			d = ThrottleRetry
 		}
 		now := s.now()
 		return s.limited(b, s.coolHandle(h.Handle, now.Add(d), now).Sub(now))
-	case errors.As(err, &fe) && (fe.Status == http.StatusInternalServerError || fe.Status == http.StatusServiceUnavailable):
-		d := s.pauseFCM(s.now(), fe.RetryAfter)
-		s.log.Warn("fcm unavailable, relay paused", "component", "relay", "status", fe.Status, "pause", d.String())
+	case errors.Is(err, push.ErrUnavailable):
+		var asked time.Duration
+		status := 0
+		if pe != nil {
+			asked, status = pe.RetryAfter, pe.Status
+		}
+		d := s.pauseProvider(provider, s.now(), asked)
+		s.log.Warn("push provider unavailable, its sends paused", "component", "relay", "provider", provider, "status", status, "pause", d.String())
 		return SendResult{Status: StatusFailed, RetryAfterSeconds: seconds(d)}
+	case errors.Is(err, push.ErrAuth):
+		s.log.Error("push provider refused the relay's credentials", "component", "relay", "provider", provider, "err", err)
+		return SendResult{Status: StatusFailed}
 	}
-	s.log.Warn("push not delivered", "component", "relay", "push_id", inst.ID, "err", err)
+	s.log.Warn("push not delivered", "component", "relay", "push_id", inst.ID, "provider", provider, "err", err)
 	return SendResult{Status: StatusFailed}
 }
 
-// finishSend records FCM's answer on a context of its own, trying a few times before giving up.
+// finishSend records the provider's answer on a context of its own, trying a few times before giving up.
 func (s *Server) finishSend(b *batch, msgID string, ok bool) error {
 	ctx, cancel := context.WithTimeout(b.db, finishSendTimeout)
 	defer cancel()
@@ -424,7 +439,7 @@ func (s *Server) finishSend(b *batch, msgID string, ok bool) error {
 	return err
 }
 
-// unregistered revokes a handle FCM no longer knows, unless the app moved it to a new token meanwhile.
+// unregistered revokes a handle its provider no longer knows, unless the app moved it to a new token meanwhile.
 func (s *Server) unregistered(ctx context.Context, b *batch, h store.Handle) SendResult {
 	err := s.store.RevokeHandleToken(ctx, h.Handle, h.FCMToken, s.now())
 	if errors.Is(err, store.ErrNotFound) {

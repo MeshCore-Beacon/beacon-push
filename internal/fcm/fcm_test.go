@@ -189,8 +189,48 @@ func TestFCMUnregisteredToken(t *testing.T) {
 		w.WriteHeader(400)
 		_, _ = w.Write([]byte(`{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"bad payload"}}`))
 	}
-	if err := f.fcm(nil).Send(context.Background(), sampleMsg); err == nil || errors.Is(err, ErrUnregistered) {
-		t.Fatalf("a plain 400 must be a failure, not an unregistered token: %v", err)
+	if err := f.fcm(nil).Send(context.Background(), sampleMsg); !errors.Is(err, ErrInvalidArgument) || errors.Is(err, ErrUnregistered) {
+		t.Fatalf("a plain 400 must be an invalid message, not an unregistered token: %v", err)
+	}
+	f.sendReply = func(w http.ResponseWriter, _ int) {
+		w.WriteHeader(400)
+		_, _ = w.Write([]byte(`{"error":{"code":400,"status":"INVALID_ARGUMENT","details":[{"errorCode":"INVALID_ARGUMENT"}]}}`))
+	}
+	if err := f.fcm(nil).Send(context.Background(), sampleMsg); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("400 INVALID_ARGUMENT detail: %v", err)
+	}
+}
+
+func TestFCMKeepsTheBackoff(t *testing.T) {
+	f := newFCMServer(t)
+	for _, c := range []struct {
+		status int
+		header string
+		body   string
+		want   time.Duration
+		code   string
+	}{
+		{503, "3600", `{"error":{"code":503,"status":"UNAVAILABLE","details":[{"errorCode":"UNAVAILABLE"}]}}`, time.Hour, "UNAVAILABLE"},
+		{429, "7", `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"errorCode":"QUOTA_EXCEEDED"}]}}`, 7 * time.Second, "QUOTA_EXCEEDED"},
+		{500, "", `{"error":{"code":500,"status":"INTERNAL"}}`, 0, "INTERNAL"},
+		{503, "Wed, 18 Nov 2026 12:00:30 GMT", ``, 30 * time.Second, ""},
+	} {
+		f.sendReply = func(w http.ResponseWriter, _ int) {
+			if c.header != "" {
+				w.Header().Set("Retry-After", c.header)
+			}
+			w.WriteHeader(c.status)
+			_, _ = w.Write([]byte(c.body))
+		}
+		now := func() time.Time { return time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC) }
+		err := f.fcm(now).Send(context.Background(), sampleMsg)
+		var fe *Error
+		if !errors.As(err, &fe) || fe.Status != c.status || fe.RetryAfter != c.want || fe.Code != c.code {
+			t.Errorf("%d %q: %#v", c.status, c.header, err)
+		}
+		if errors.Is(err, ErrInvalidArgument) || errors.Is(err, ErrUnregistered) {
+			t.Errorf("%d: %v", c.status, err)
+		}
 	}
 }
 

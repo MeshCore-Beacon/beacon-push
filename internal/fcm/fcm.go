@@ -43,6 +43,29 @@ type Message struct {
 // ErrUnregistered means the push service no longer knows the token: the handle should go.
 var ErrUnregistered = errors.New("fcm: token unregistered")
 
+// ErrInvalidArgument means FCM refused the message itself (400 INVALID_ARGUMENT): sending it again cannot work.
+var ErrInvalidArgument = errors.New("fcm: message refused as invalid")
+
+// Error is any other refusal from FCM. It keeps the status, the error code and the asked-for wait, never the token
+// or the reply body.
+type Error struct {
+	Status     int
+	Code       string        // FCM errorCode, else the Google status; may be empty
+	RetryAfter time.Duration // 0 when FCM gave none
+}
+
+func (e *Error) Error() string {
+	if e.Code != "" {
+		return fmt.Sprintf("fcm answered %d %s", e.Status, e.Code)
+	}
+	return fmt.Sprintf("fcm answered %d", e.Status)
+}
+
+// Is lets errors.Is(err, ErrInvalidArgument) match a 400 INVALID_ARGUMENT.
+func (e *Error) Is(target error) bool {
+	return target == ErrInvalidArgument && e.Status == http.StatusBadRequest && e.Code == "INVALID_ARGUMENT"
+}
+
 // Sender sends one message.
 type Sender interface {
 	Send(ctx context.Context, m Message) error
@@ -223,8 +246,8 @@ func (f *FCM) body(m Message) []byte {
 	return b
 }
 
-// Send posts one message. ErrUnregistered when Google says the device token is gone; other failures carry only the
-// HTTP status.
+// Send posts one message. ErrUnregistered when Google says the device token is gone, ErrInvalidArgument when it refuses
+// the message, otherwise an *Error for an FCM answer or a plain error when FCM could not be reached.
 func (f *FCM) Send(ctx context.Context, m Message) error {
 	body := f.body(m)
 	for attempt := 0; ; attempt++ {
@@ -254,18 +277,20 @@ func (f *FCM) Send(ctx context.Context, m Message) error {
 		case resp.StatusCode == http.StatusUnauthorized && attempt == 0:
 			f.forgetToken() // the cached access token went stale: get a new one once
 			continue
-		case unregistered(resp.StatusCode, reply):
+		}
+		code, status := errorCode(reply)
+		if code == "UNREGISTERED" || (resp.StatusCode == http.StatusNotFound && (status == "NOT_FOUND" || status == "UNREGISTERED")) {
 			return ErrUnregistered
 		}
-		return fmt.Errorf("fcm answered %d", resp.StatusCode)
+		if code == "" {
+			code = status
+		}
+		return &Error{Status: resp.StatusCode, Code: code, RetryAfter: retryAfter(resp.Header.Get("Retry-After"), f.now())}
 	}
 }
 
-// unregistered reads Google's error: 404 NOT_FOUND or UNREGISTERED, or 400 with an INVALID_ARGUMENT about the token.
-func unregistered(status int, reply []byte) bool {
-	if status != http.StatusNotFound && status != http.StatusBadRequest {
-		return false
-	}
+// errorCode reads Google's error reply: the FCM errorCode from its details, and the Google status.
+func errorCode(reply []byte) (code, status string) {
 	var e struct {
 		Error struct {
 			Status  string `json:"status"`
@@ -275,12 +300,42 @@ func unregistered(status int, reply []byte) bool {
 		} `json:"error"`
 	}
 	if json.Unmarshal(reply, &e) != nil {
-		return false
+		return "", ""
 	}
 	for _, d := range e.Error.Details {
-		if d.ErrorCode == "UNREGISTERED" {
-			return true
+		if d.ErrorCode != "" {
+			code = d.ErrorCode
+			break
 		}
 	}
-	return status == http.StatusNotFound && (e.Error.Status == "NOT_FOUND" || e.Error.Status == "UNREGISTERED")
+	// Only short upper-case words, so nothing odd from the reply reaches a log line.
+	clean := func(v string) string {
+		if len(v) > 40 {
+			return ""
+		}
+		for _, c := range v {
+			if (c < 'A' || c > 'Z') && c != '_' {
+				return ""
+			}
+		}
+		return v
+	}
+	return clean(code), clean(e.Error.Status)
+}
+
+// retryAfter reads a Retry-After header in seconds or as an HTTP date; 0 when absent or unreadable.
+func retryAfter(v string, now time.Time) time.Duration {
+	if v == "" {
+		return 0
+	}
+	if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if n <= 0 {
+			return 0
+		}
+		return time.Duration(min(n, 86400)) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil && t.After(now) {
+		return t.Sub(now)
+	}
+	return 0
 }

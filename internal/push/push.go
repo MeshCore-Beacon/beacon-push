@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -104,4 +106,21 @@ func (Log) Send(_ context.Context, m Message) error {
 	slog.Info("push (dev mode, not sent)", "component", Provider(m.Platform), "platform", m.Platform, "apns_env", m.APNsEnv,
 		"data_keys", len(m.Data), "collapse_key", m.CollapseKey)
 	return nil
+}
+
+// RetryAfter reads a Retry-After header in seconds or as an HTTP date; 0 when absent or unreadable.
+func RetryAfter(v string, now time.Time) time.Duration {
+	if v == "" {
+		return 0
+	}
+	if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if n <= 0 {
+			return 0
+		}
+		return time.Duration(min(n, 86400)) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil && t.After(now) {
+		return t.Sub(now)
+	}
+	return 0
 }

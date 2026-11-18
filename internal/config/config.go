@@ -21,14 +21,17 @@ type Config struct {
 	PublicURL *url.URL
 	// DatabasePath is the SQLite file.
 	DatabasePath string
-	// FirebaseCredentials is the path of the service-account key file. Empty only in dev mode.
+	// FirebaseCredentials is the path of the service-account key file, for Android. Empty only in dev mode.
 	FirebaseCredentials string
-	SMTPHost            string
-	SMTPPort            int
-	SMTPUsername        string
-	SMTPPassword        string
-	SMTPFrom            string
-	SMTPStartTLS        bool
+	// APNsKey is the path of the .p8 token key, for iOS; APNsKeyID and APNsTeamID name it and APNsTopic is the app's
+	// bundle ID. Empty only in dev mode.
+	APNsKey, APNsKeyID, APNsTeamID, APNsTopic string
+	SMTPHost                                  string
+	SMTPPort                                  int
+	SMTPUsername                              string
+	SMTPPassword                              string
+	SMTPFrom                                  string
+	SMTPStartTLS                              bool
 	// AdminEmail receives notices of new servers and automatic suspensions. Empty sends none.
 	AdminEmail string
 	// TrustProxy takes the client address from the last X-Forwarded-For entry, for running behind Caddy.
@@ -44,6 +47,10 @@ func Load(getenv func(string) string) (Config, error) {
 		ListenAddr:          or(getenv("PUSH_LISTEN_ADDR"), ":8080"),
 		DatabasePath:        or(getenv("PUSH_DATABASE_PATH"), "/data/beacon-push.db"),
 		FirebaseCredentials: strings.TrimSpace(getenv("PUSH_FIREBASE_CREDENTIALS")),
+		APNsKey:             strings.TrimSpace(getenv("PUSH_APNS_KEY")),
+		APNsKeyID:           strings.TrimSpace(getenv("PUSH_APNS_KEY_ID")),
+		APNsTeamID:          strings.TrimSpace(getenv("PUSH_APNS_TEAM_ID")),
+		APNsTopic:           strings.TrimSpace(getenv("PUSH_APNS_TOPIC")),
 		SMTPHost:            strings.TrimSpace(getenv("PUSH_SMTP_HOST")),
 		SMTPUsername:        getenv("PUSH_SMTP_USERNAME"),
 		SMTPPassword:        getenv("PUSH_SMTP_PASSWORD"),
@@ -84,6 +91,18 @@ func Load(getenv func(string) string) (Config, error) {
 	if c.FirebaseCredentials == "" {
 		return Config{}, errors.New("PUSH_FIREBASE_CREDENTIALS: required, the path of the Firebase service-account key file")
 	}
+	if c.APNsKey == "" {
+		return Config{}, errors.New("PUSH_APNS_KEY: required, the path of the APNs .p8 key file")
+	}
+	if !appleID(c.APNsKeyID) {
+		return Config{}, errors.New("PUSH_APNS_KEY_ID: required, the 10-character ID of the APNs key")
+	}
+	if !appleID(c.APNsTeamID) {
+		return Config{}, errors.New("PUSH_APNS_TEAM_ID: required, the 10-character Apple team ID")
+	}
+	if c.APNsTopic == "" || strings.ContainsAny(c.APNsTopic, " /") {
+		return Config{}, errors.New("PUSH_APNS_TOPIC: required, the app's bundle ID, e.g. meshcorebeacon.app")
+	}
 	if c.SMTPHost == "" {
 		return Config{}, errors.New("PUSH_SMTP_HOST: required, registration works by mailed links")
 	}
@@ -96,6 +115,19 @@ func Load(getenv func(string) string) (Config, error) {
 		}
 	}
 	return c, nil
+}
+
+// appleID is the shape of Apple key and team IDs: 10 upper-case letters or digits.
+func appleID(v string) bool {
+	if len(v) != 10 {
+		return false
+	}
+	for _, c := range v {
+		if (c < 'A' || c > 'Z') && (c < '0' || c > '9') {
+			return false
+		}
+	}
+	return true
 }
 
 func or(v, def string) string {

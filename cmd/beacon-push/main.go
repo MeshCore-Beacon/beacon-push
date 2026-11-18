@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/MeshCore-Beacon/beacon-push/internal/apns"
 	"github.com/MeshCore-Beacon/beacon-push/internal/config"
 	"github.com/MeshCore-Beacon/beacon-push/internal/fcm"
 	"github.com/MeshCore-Beacon/beacon-push/internal/mail"
@@ -76,7 +77,11 @@ func serve() error {
 		if err != nil {
 			return err
 		}
-		sender = push.Router{IOS: f, Android: f}
+		a, err := apns.Load(cfg.APNsKey, cfg.APNsKeyID, cfg.APNsTeamID, cfg.APNsTopic)
+		if err != nil {
+			return err
+		}
+		sender = push.Router{IOS: a, Android: f}
 		mailer = mail.NewSMTP(cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPUsername, cfg.SMTPPassword, cfg.SMTPFrom, cfg.SMTPStartTLS)
 	}
 

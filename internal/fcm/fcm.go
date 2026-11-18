@@ -263,7 +263,7 @@ func (f *FCM) Send(ctx context.Context, m push.Message) error {
 		if code == "" {
 			code = status
 		}
-		e := &push.Error{Provider: push.FCM, Status: resp.StatusCode, Code: code, RetryAfter: retryAfter(resp.Header.Get("Retry-After"), f.now())}
+		e := &push.Error{Provider: push.FCM, Status: resp.StatusCode, Code: code, RetryAfter: push.RetryAfter(resp.Header.Get("Retry-After"), f.now())}
 		switch resp.StatusCode {
 		case http.StatusBadRequest:
 			if code == "INVALID_ARGUMENT" {
@@ -312,21 +312,4 @@ func errorCode(reply []byte) (code, status string) {
 		return v
 	}
 	return clean(code), clean(e.Error.Status)
-}
-
-// retryAfter reads a Retry-After header in seconds or as an HTTP date; 0 when absent or unreadable.
-func retryAfter(v string, now time.Time) time.Duration {
-	if v == "" {
-		return 0
-	}
-	if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-		if n <= 0 {
-			return 0
-		}
-		return time.Duration(min(n, 86400)) * time.Second
-	}
-	if t, err := http.ParseTime(v); err == nil && t.After(now) {
-		return t.Sub(now)
-	}
-	return 0
 }

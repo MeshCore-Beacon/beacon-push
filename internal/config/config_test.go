@@ -14,6 +14,10 @@ func prod() map[string]string {
 	return map[string]string{
 		"PUSH_PUBLIC_URL":           "https://push.meshcorebeacon.ca/",
 		"PUSH_FIREBASE_CREDENTIALS": "/run/secrets/firebase.json",
+		"PUSH_APNS_KEY":             "/run/secrets/apns.p8",
+		"PUSH_APNS_KEY_ID":          "ABC123DEFG",
+		"PUSH_APNS_TEAM_ID":         "TEAM123456",
+		"PUSH_APNS_TOPIC":           "meshcorebeacon.app",
 		"PUSH_SMTP_HOST":            "mail.example.ca",
 		"PUSH_SMTP_FROM":            "Beacon Push <noreply@meshcorebeacon.ca>",
 	}
@@ -25,7 +29,8 @@ func TestLoadProduction(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c.PublicURL.String() != "https://push.meshcorebeacon.ca" || c.ListenAddr != ":8080" || c.SMTPPort != 587 || !c.SMTPStartTLS ||
-		c.DatabasePath != "/data/beacon-push.db" || c.DevMode || c.TrustProxy {
+		c.DatabasePath != "/data/beacon-push.db" || c.DevMode || c.TrustProxy || c.APNsKey != "/run/secrets/apns.p8" ||
+		c.APNsKeyID != "ABC123DEFG" || c.APNsTeamID != "TEAM123456" || c.APNsTopic != "meshcorebeacon.app" {
 		t.Fatalf("%+v", c)
 	}
 }
@@ -34,6 +39,10 @@ func TestLoadRefusesIncompleteProduction(t *testing.T) {
 	for key, want := range map[string]string{
 		"PUSH_PUBLIC_URL":           "PUSH_PUBLIC_URL",
 		"PUSH_FIREBASE_CREDENTIALS": "PUSH_FIREBASE_CREDENTIALS",
+		"PUSH_APNS_KEY":             "PUSH_APNS_KEY",
+		"PUSH_APNS_KEY_ID":          "PUSH_APNS_KEY_ID",
+		"PUSH_APNS_TEAM_ID":         "PUSH_APNS_TEAM_ID",
+		"PUSH_APNS_TOPIC":           "PUSH_APNS_TOPIC",
 		"PUSH_SMTP_HOST":            "PUSH_SMTP_HOST",
 		"PUSH_SMTP_FROM":            "PUSH_SMTP_FROM",
 	} {
@@ -44,10 +53,13 @@ func TestLoadRefusesIncompleteProduction(t *testing.T) {
 		}
 	}
 	for key, val := range map[string]string{
-		"PUSH_PUBLIC_URL":  "http://push.meshcorebeacon.ca",
-		"PUSH_SMTP_PORT":   "70000",
-		"PUSH_DEV_MODE":    "maybe",
-		"PUSH_ADMIN_EMAIL": "not an address",
+		"PUSH_PUBLIC_URL":   "http://push.meshcorebeacon.ca",
+		"PUSH_SMTP_PORT":    "70000",
+		"PUSH_DEV_MODE":     "maybe",
+		"PUSH_ADMIN_EMAIL":  "not an address",
+		"PUSH_APNS_KEY_ID":  "abc123defg",
+		"PUSH_APNS_TEAM_ID": "TEAM12345",
+		"PUSH_APNS_TOPIC":   "bad topic",
 	} {
 		m := prod()
 		m[key] = val

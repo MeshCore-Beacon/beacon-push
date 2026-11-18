@@ -3,7 +3,7 @@ build/
 dist/
 /beacon-push
 
-# Environment and local config (Firebase key, SMTP and instance credentials)
+# Environment and local config (Firebase and APNs keys, SMTP and instance credentials)
 .env
 .env.*
 !.env.example
@@ -11,6 +11,7 @@ config.yaml
 config.local.*
 *-firebase-adminsdk-*.json
 service-account*.json
+*.p8
 
 # Data
 *.db

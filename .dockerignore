@@ -6,3 +6,4 @@ docs/superpowers
 *.db-*
 .env
 .env.*
+*.p8

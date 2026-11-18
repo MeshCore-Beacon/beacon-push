@@ -10,7 +10,8 @@ server, the project's own included, sends its push alerts through it.
 ## How it fits
 
 ```
-beacon-server ──HTTPS──> beacon-push ──FCM──> phone (iOS and Android)
+beacon-server ──HTTPS──> beacon-push ──APNs──> iPhone
+                                     └──FCM───> Android phone
 ```
 
 1. A server operator registers at `https://push.meshcorebeacon.ca/register`
@@ -20,7 +21,8 @@ beacon-server ──HTTPS──> beacon-push ──FCM──> phone (iOS and And
 3. The Beacon app gets a device handle from the relay that only works for that
    server, and gives the handle to the server.
 4. When an alert fires, beacon-server encrypts it for that device and sends
-   it to the relay, which forwards it through Firebase Cloud Messaging.
+   it to the relay, which forwards it straight to Apple's push service (APNs)
+   for an iPhone, or through Firebase Cloud Messaging (FCM) for Android.
 
 ## What the relay sees
 
@@ -29,6 +31,10 @@ server's registered name on it, rate-limits each server and device, and keeps
 usage records (server, time, device handle, size, a hash of the ciphertext)
 for 30 days to catch abuse. Notification contents are end-to-end encrypted
 between beacon-server and the app; the relay cannot read them.
+
+Apple sees the notifications that go to iPhones and Google sees the ones that
+go to Android phones, each with its device token and the encrypted payload.
+Neither sees the other platform's traffic.
 
 ## Registering a server
 
@@ -88,35 +94,40 @@ Authenticate with `Authorization: Bearer <push id>.<push secret>`.
   beacon-server uses `<outbox row id>:<device session uuid>`.
 
 The relay sends up to 8 messages of a batch at once and starts no new one
-after 10 seconds; each message's whole FCM send, access token included, is
-limited to 10 seconds, so the answer comes within about 20 seconds. Items not started in time answer `rate_limited` with
+after 10 seconds; each message's whole send to APNs or FCM, token refresh
+included, is limited to 10 seconds, so the answer comes within about 20 seconds. Items not started in time answer `rate_limited` with
 `retryAfterSeconds: 5`.
 
 The answer has one result per message, in order:
 `{"results": [{"messageId": "m_…", "status": "ok"}, {"status": "rate_limited", "retryAfterSeconds": 42}]}`.
 `retryAfterSeconds` (whole seconds, at least 1) comes with every
-`rate_limited` result and with a `failed` one caused by an FCM outage. The
+`rate_limited` result and with a `failed` one caused by an APNs or FCM outage. The
 response's `Retry-After` header carries the largest wait in the batch, for
 servers that do not read the field.
 
 | status | Meaning | What the server does |
 |---|---|---|
-| `ok` | Handed to FCM | Mark delivered |
-| `rate_limited` | Not sent: over a limit, the relay paused after FCM 500/503, not started before the batch deadline, or an `id` still in flight | Hold until `retryAfterSeconds` (else `Retry-After`); not an attempt |
-| `invalid_handle` | Unknown, revoked, another server's, or FCM said UNREGISTERED for the handle's current token | Delete the device |
-| `too_large`, `invalid` | Refused: a bad item, or FCM refused the message (400 INVALID_ARGUMENT) | Done for this notice, never resend |
-| `failed` | Transient: FCM unreachable or another FCM error, the token changed while sending, or the relay could not record a send FCM accepted | Retry later; counts an attempt |
+| `ok` | Handed to APNs or FCM | Mark delivered |
+| `rate_limited` | Not sent: over a limit, the device's push service is paused after an outage, not started before the batch deadline, or an `id` still in flight | Hold until `retryAfterSeconds` (else `Retry-After`); not an attempt |
+| `invalid_handle` | Unknown, revoked, another server's, or the push service no longer knows the handle's current token (APNs 410, `BadDeviceToken` or `DeviceTokenNotForTopic`; FCM UNREGISTERED) | Delete the device |
+| `too_large`, `invalid` | Refused: a bad item, a payload over APNs' 4 KB, or the push service refused the message (APNs 400, FCM 400 INVALID_ARGUMENT) | Done for this notice, never resend |
+| `failed` | Transient: the push service unreachable or another error from it, the relay's own APNs or FCM credentials refused, the token changed while sending, or the relay could not record a send the push service accepted | Retry later; counts an attempt |
 
-When FCM answers 500 or 503, the relay stops sending for everyone for FCM's
-`Retry-After`, at most a day. Without one it pauses a minute, doubling with
-each new outage up to an hour, until a send succeeds after the pause has
-ended. That item is
-`failed` and every item after it is `rate_limited` until the pause ends. An
-FCM 429 makes that item `rate_limited`, for FCM's `Retry-After` (a minute if
-it gives none, at most a day), and later items for the same device wait,
-without reaching FCM, until the longest wait FCM has asked for that device
-ends. A message counts against the daily quotas while it is being sent
-and stays counted only if FCM accepts it.
+APNs and FCM are paused separately: an outage of one never holds back the
+other. When APNs answers 5xx or FCM answers 500 or 503, the relay stops
+sending through that service for its `Retry-After`, at most a day. Without
+one it pauses a minute, doubling with each new outage up to an hour, until a
+send through it succeeds after the pause has ended. That item is `failed` and
+every later item for the same service is `rate_limited` until the pause ends.
+A 429 for a device makes that item `rate_limited`, for the `Retry-After` the
+service gave (a minute if it gives none, at most a day), and later items for
+the same device wait, without reaching the service, until the longest wait
+asked for that device ends. A message counts against the daily quotas while
+it is being sent and stays counted only if the push service accepts it.
+
+When APNs refuses the relay's provider token as expired or invalid, the relay
+signs a new one and tries once more. If that fails too, the item is `failed`
+and the relay logs an error: its APNs key needs attention.
 
 A suspended server gets `403 suspended` for the whole batch, and a banned one
 `403 banned`. A batch waiting behind another from the same server checks the
@@ -128,18 +139,30 @@ them again before it goes out.
 
 ### For the app
 
-**`POST /v1/handles`** with `{"pushId", "platform": "ios"|"android", "fcmToken"}`
-answers `200` with `{"handle", "handleSecret"}`. `fcmToken` is up to 4,096 of
-`A-Z a-z 0-9 _ - :`. The same token on the same server keeps its handle and
-gets a new secret. Errors:
+**`POST /v1/handles`** with
+`{"pushId", "platform": "ios"|"android", "token", "apnsEnvironment"}`
+answers `200` with `{"handle", "handleSecret"}`.
+
+- On iOS, `token` is the APNs device token in hex (64 to 200 characters,
+  either case; stored lower-case), and `apnsEnvironment` is `sandbox` for a
+  development build or `production` for TestFlight and App Store builds.
+- On Android, `token` is the FCM registration token, up to 4,096 of
+  `A-Z a-z 0-9 _ - :`, and `apnsEnvironment` must be left out.
+
+The same token on the same server keeps its handle and gets a new secret.
+Errors:
 
 - `400 bad_platform`: `platform` is not `ios` or `android`.
-- `400 bad_token`: `fcmToken` is missing or malformed.
+- `400 bad_apns_environment`: iOS without `sandbox` or `production`, or
+  Android with an `apnsEnvironment`.
+- `400 bad_token`: `token` is missing or malformed for the platform.
 - `404 unknown_server`: no server has that Push ID.
 - `403 server_unavailable`: the server is suspended or banned.
 
-**`PUT /v1/handles/{handle}`** with `{"handleSecret", "fcmToken"}` moves the
-handle to a refreshed token. It answers `204`, or `400 bad_token`.
+**`PUT /v1/handles/{handle}`** with `{"handleSecret", "token", "apnsEnvironment"}`
+moves the handle to a refreshed token, and on iOS to the given environment,
+which is required there as on `POST`. It answers `204`, `400 bad_token` or
+`400 bad_apns_environment`.
 
 **`DELETE /v1/handles/{handle}`** with `{"handleSecret"}` stops the handle. It
 answers `204`.
@@ -151,15 +174,19 @@ updates and deletes an hour; past that it gets `429 rate_limited` with
 
 ### What reaches the phone
 
-FCM data, the same on both platforms:
+The same fields on both platforms:
 
 ```json
 { "v": "1", "pushId": "inst_…", "serverName": "Ottawa Mesh", "messageId": "m_…", "ct": "<base64 ciphertext>" }
 ```
 
-Android gets a data-only, high-priority message. iOS gets a placeholder alert
+Android gets them as the data of a data-only, high-priority FCM message. iOS
+gets them as top-level keys of the APNs payload, next to a placeholder alert
 (title: the server name, body: "New alert") with `mutable-content: 1`, so the
 Notification Service Extension decrypts the message and replaces the text.
+The APNs request has `apns-push-type: alert`, `apns-priority: 10`, an
+`apns-expiration` from `ttlSeconds`, and the collapse key as
+`apns-collapse-id` (hashed when the prefixed key is over 64 bytes).
 
 ### Domain check
 
@@ -177,13 +204,19 @@ A match proves that the host at that URL holds the Push secret.
 ## Running the relay
 
 The project runs the official instance, and the Beacon app only accepts
-notifications from it. Forks that ship their own app and Firebase project can
-run their own; there's no support for that beyond this README.
+notifications from it. Forks that ship their own app, Apple team and Firebase
+project can run their own; there's no support for that beyond this README.
 
 The image is `ghcr.io/meshcore-beacon/beacon-push`. Configuration comes from
 the environment: see [`.env.example`](.env.example). It needs:
 
-- a Firebase service-account key file, mounted read-only;
+- a Firebase service-account key file, mounted read-only, for Android;
+- an APNs auth key (`.p8`) from the Apple Developer account, mounted
+  read-only, with its key ID, the team ID and the app's bundle ID
+  (`PUSH_APNS_KEY`, `PUSH_APNS_KEY_ID`, `PUSH_APNS_TEAM_ID`,
+  `PUSH_APNS_TOPIC`), for iOS. The key works for both the sandbox and
+  production environments; each handle says which one its device uses. A key
+  that cannot be read stops the relay at startup;
 - an SMTP account for registration mail;
 - a volume at `/data` for the SQLite database. Back it up daily with
   `beacon-push admin backup /data/backup-$(date +%F).db` (from cron through `docker exec`) and copy the file off

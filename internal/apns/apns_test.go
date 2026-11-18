@@ -229,6 +229,7 @@ func TestMapsAppleAnswers(t *testing.T) {
 		{400, "BadDeviceToken", "", push.ErrUnregistered, 0},
 		{400, "DeviceTokenNotForTopic", "", push.ErrUnregistered, 0},
 		{400, "BadCollapseId", "", push.ErrInvalid, 0},
+		{400, "IdleTimeout", "", nil, 0},
 		{400, "", "", push.ErrInvalid, 0},
 		{413, "PayloadTooLarge", "", push.ErrTooLarge, 0},
 		{429, "TooManyRequests", "", push.ErrThrottled, 0},

@@ -111,7 +111,7 @@ servers that do not read the field.
 | `rate_limited` | Not sent: over a limit, the device's push service is paused after an outage, not started before the batch deadline, or an `id` still in flight | Hold until `retryAfterSeconds` (else `Retry-After`); not an attempt |
 | `invalid_handle` | Unknown, revoked, another server's, or the push service no longer knows the handle's current token (APNs 410, `BadDeviceToken` or `DeviceTokenNotForTopic`; FCM UNREGISTERED) | Delete the device |
 | `too_large`, `invalid` | Refused: a bad item, a payload over APNs' 4 KB, or the push service refused the message (APNs 400, FCM 400 INVALID_ARGUMENT) | Done for this notice, never resend |
-| `failed` | Transient: the push service unreachable or another error from it, the relay's own APNs or FCM credentials refused, the token changed while sending, or the relay could not record a send the push service accepted | Retry later; counts an attempt |
+| `failed` | Transient: the push service unreachable or another error from it (such as APNs `IdleTimeout`), the relay's own APNs or FCM credentials refused, the app refreshed or registered the device again while it was being sent, or the relay could not record a send the push service accepted | Retry later; counts an attempt |
 
 APNs and FCM are paused separately: an outage of one never holds back the
 other. When APNs answers 5xx or FCM answers 500 or 503, the relay stops

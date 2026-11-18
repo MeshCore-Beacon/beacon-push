@@ -225,6 +225,8 @@ func kindOf(status int, reason string) error {
 	switch {
 	case status == http.StatusGone, status == http.StatusBadRequest && (reason == "BadDeviceToken" || reason == "DeviceTokenNotForTopic"):
 		return push.ErrUnregistered
+	case status == http.StatusBadRequest && reason == "IdleTimeout":
+		return nil // Apple closed an idle connection: a plain failure, retried later
 	case status == http.StatusRequestEntityTooLarge:
 		return push.ErrTooLarge
 	case status == http.StatusBadRequest:

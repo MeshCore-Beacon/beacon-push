@@ -428,6 +428,26 @@ func TestStaleUnregisteredKeepsARegistrationMadeAgain(t *testing.T) {
 	}
 }
 
+func TestAPNsIdleTimeoutIsRetryable(t *testing.T) {
+	h := newHarness(t)
+	id, auth := h.register("A", "a@example.org", "")
+	phone := h.iosHandle(id, apnsToken, "production").Handle
+	h.push.set(func(f *fakePush) {
+		f.errs[apnsToken] = &push.Error{Provider: push.APNs, Status: 400, Code: "IdleTimeout"}
+	})
+	if res, _ := h.send(auth, items(phone)...); res[0].Status != StatusFailed || res[0].RetryAfterSeconds != 0 {
+		t.Fatalf("%+v", res)
+	}
+	now := h.clock.now()
+	if h.relay.pausedFor(push.APNs, now) > 0 || h.relay.cooledFor(phone, now) > 0 {
+		t.Fatal("an idle timeout paused APNs or cooled the device")
+	}
+	h.push.set(func(f *fakePush) { delete(f.errs, apnsToken) })
+	if res, _ := h.send(auth, items(phone)...); res[0].Status != StatusOK {
+		t.Fatalf("retry: %+v", res)
+	}
+}
+
 func TestFCMOutagePausesTheRelay(t *testing.T) {
 	h := newHarness(t)
 	id, auth := h.register("A", "a@example.org", "")

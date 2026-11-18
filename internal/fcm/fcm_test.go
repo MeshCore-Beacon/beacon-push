@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -37,6 +38,9 @@ type fcmServer struct {
 	lastPath  string
 	sendReply func(w http.ResponseWriter, hit int)
 	expiresIn int
+
+	tokenDelay  atomic.Int64 // nanoseconds the token endpoint waits before answering
+	tokenStatus atomic.Int64 // non-zero: the token endpoint answers this status
 }
 
 func newFCMServer(t *testing.T) *fcmServer {
@@ -47,6 +51,21 @@ func newFCMServer(t *testing.T) *fcmServer {
 	}
 	f := &fcmServer{t: t, key: key, expiresIn: 3600}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			_ = r.ParseForm() // read the body so a client that gives up cancels r.Context
+			select {
+			case <-time.After(time.Duration(f.tokenDelay.Load())):
+			case <-r.Context().Done():
+				return
+			}
+			if st := f.tokenStatus.Load(); st != 0 {
+				f.mu.Lock()
+				f.tokenHits++
+				f.mu.Unlock()
+				w.WriteHeader(int(st))
+				return
+			}
+		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		switch {
@@ -321,5 +340,44 @@ func TestLoad(t *testing.T) {
 	}
 	if _, err := Load(filepath.Join(dir, "missing.json")); err == nil || strings.Contains(err.Error(), dir) {
 		t.Errorf("missing file: %v", err)
+	}
+}
+
+func TestFCMSendHasOneDeadline(t *testing.T) {
+	f := newFCMServer(t)
+	f.tokenDelay.Store(int64(5 * time.Second))
+	c := f.fcm(nil)
+	c.sendLimit = 300 * time.Millisecond
+	start := time.Now()
+	if err := c.Send(context.Background(), sampleMsg); err == nil {
+		t.Fatal("a hanging token endpoint let the send through")
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("send took %s with a 300 ms limit", took)
+	}
+}
+
+func TestFCMSharesAFailedTokenRefresh(t *testing.T) {
+	f := newFCMServer(t)
+	f.tokenDelay.Store(int64(300 * time.Millisecond))
+	f.tokenStatus.Store(503)
+	c := f.fcm(nil)
+	var wg sync.WaitGroup
+	start := time.Now()
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := c.Send(context.Background(), sampleMsg); err == nil {
+				t.Error("send passed without an access token")
+			}
+		}()
+	}
+	wg.Wait()
+	f.mu.Lock()
+	hits := f.tokenHits
+	f.mu.Unlock()
+	if took := time.Since(start); hits != 1 || took > 1500*time.Millisecond {
+		t.Fatalf("%d token requests in %s; waiting senders must share one failure", hits, took)
 	}
 }

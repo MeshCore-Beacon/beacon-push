@@ -83,6 +83,8 @@ const (
 	scope          = "https://www.googleapis.com/auth/firebase.messaging"
 	sendBase       = "https://fcm.googleapis.com"
 	callLimit      = 10 * time.Second
+	sendLimit      = 10 * time.Second // a whole Send: token, 401 retry and waits included
+	tokenRetryIn   = 5 * time.Second  // a failed token request is shared this long before the next try
 	maxReply       = 64 << 10
 	tokenLifetime  = time.Hour
 	tokenRefreshIn = 2 * time.Minute // refresh this long before the access token expires
@@ -96,10 +98,15 @@ type FCM struct {
 	key                                        *rsa.PrivateKey
 	client                                     *http.Client
 	now                                        func() time.Time
+	sendLimit                                  time.Duration
 
-	mu     sync.Mutex
-	access string
-	expiry time.Time
+	refreshing chan struct{} // one token request at a time; a waiter gives up with its context
+
+	mu        sync.Mutex
+	access    string
+	expiry    time.Time
+	failErr   error
+	failUntil time.Time
 }
 
 type serviceAccount struct {
@@ -158,7 +165,8 @@ func New(projectID, clientEmail, tokenURL, base string, key *rsa.PrivateKey, cli
 	if now == nil {
 		now = time.Now
 	}
-	return &FCM{projectID: projectID, clientEmail: clientEmail, tokenURL: tokenURL, sendBase: strings.TrimRight(base, "/"), key: key, client: client, now: now}
+	return &FCM{projectID: projectID, clientEmail: clientEmail, tokenURL: tokenURL, sendBase: strings.TrimRight(base, "/"), key: key,
+		client: client, now: now, sendLimit: sendLimit, refreshing: make(chan struct{}, 1)}
 }
 
 func b64(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
@@ -177,28 +185,64 @@ func (f *FCM) assertion() (string, error) {
 	return signing + "." + b64(sig), nil
 }
 
-// accessToken returns the cached access token, getting a new one when it is near expiry.
-func (f *FCM) accessToken(ctx context.Context) (string, error) {
+// cached is the usable access token, or the recent token failure every caller shares.
+func (f *FCM) cached() (string, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.access != "" && f.now().Add(tokenRefreshIn).Before(f.expiry) {
-		return f.access, nil
+	now := f.now()
+	if f.access != "" && now.Add(tokenRefreshIn).Before(f.expiry) {
+		return f.access, true, nil
 	}
+	if f.failErr != nil && now.Before(f.failUntil) {
+		return "", true, f.failErr
+	}
+	return "", false, nil
+}
+
+// accessToken returns the cached access token, getting a new one when it is near expiry.
+func (f *FCM) accessToken(ctx context.Context) (string, error) {
+	if tok, ok, err := f.cached(); ok {
+		return tok, err
+	}
+	select {
+	case f.refreshing <- struct{}{}:
+	case <-ctx.Done():
+		return "", errors.New("fcm token request timed out")
+	}
+	defer func() { <-f.refreshing }()
+	// Whoever held the slot may have just refreshed, or failed.
+	if tok, ok, err := f.cached(); ok {
+		return tok, err
+	}
+	tok, expiresIn, err := f.requestToken(ctx)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err != nil {
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			f.failErr, f.failUntil = err, f.now().Add(tokenRetryIn)
+		}
+		return "", err
+	}
+	f.access, f.expiry, f.failErr = tok, f.now().Add(expiresIn), nil
+	return tok, nil
+}
+
+func (f *FCM) requestToken(ctx context.Context) (string, time.Duration, error) {
 	jwt, err := f.assertion()
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	form := url.Values{"grant_type": {"urn:ietf:params:oauth:grant-type:jwt-bearer"}, "assertion": {jwt}}
 	ctx, cancel := context.WithTimeout(ctx, callLimit)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
-		return "", errors.New("fcm token request failed")
+		return "", 0, errors.New("fcm token request failed")
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := f.client.Do(req)
 	if err != nil {
-		return "", errors.New("fcm token endpoint unreachable")
+		return "", 0, errors.New("fcm token endpoint unreachable")
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxReply))
@@ -207,11 +251,9 @@ func (f *FCM) accessToken(ctx context.Context) (string, error) {
 		ExpiresIn   int64  `json:"expires_in"`
 	}
 	if resp.StatusCode != http.StatusOK || json.Unmarshal(body, &out) != nil || out.AccessToken == "" {
-		return "", fmt.Errorf("fcm token endpoint answered %d", resp.StatusCode)
+		return "", 0, fmt.Errorf("fcm token endpoint answered %d", resp.StatusCode)
 	}
-	f.access = out.AccessToken
-	f.expiry = f.now().Add(time.Duration(out.ExpiresIn) * time.Second)
-	return f.access, nil
+	return out.AccessToken, time.Duration(out.ExpiresIn) * time.Second, nil
 }
 
 func (f *FCM) forgetToken() {
@@ -249,6 +291,8 @@ func (f *FCM) body(m Message) []byte {
 // Send posts one message. ErrUnregistered when Google says the device token is gone, ErrInvalidArgument when it refuses
 // the message, otherwise an *Error for an FCM answer or a plain error when FCM could not be reached.
 func (f *FCM) Send(ctx context.Context, m Message) error {
+	ctx, cancel := context.WithTimeout(ctx, f.sendLimit)
+	defer cancel()
 	body := f.body(m)
 	for attempt := 0; ; attempt++ {
 		access, err := f.accessToken(ctx)

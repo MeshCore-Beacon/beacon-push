@@ -354,6 +354,34 @@ func (s *Store) SetDomainCheck(ctx context.Context, id string, passed bool, now 
 	return s.exec1(ctx, `UPDATE instances SET domain_checked_at = ?, domain_verified_at = 0 WHERE id = ?`, Ms(now), id)
 }
 
+// DeleteInstance removes a server and everything kept for it, in one transaction. Its email is not banned and
+// gets the registration slot back. ErrNotFound when there is no such server.
+func (s *Store) DeleteInstance(ctx context.Context, id string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// Handles would cascade, but deleting them here does not depend on the foreign_keys pragma.
+	for _, q := range []string{
+		`DELETE FROM send_log WHERE instance_id = ?`,
+		`DELETE FROM usage_daily WHERE instance_id = ?`,
+		`DELETE FROM handles WHERE instance_id = ?`,
+	} {
+		if _, err := tx.ExecContext(ctx, q, id); err != nil {
+			return err
+		}
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM instances WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return tx.Commit()
+}
+
 // ── Handles ─────────────────────────────────────────────────────────────────────────────────────
 
 // Handle is one device's registration with one server.

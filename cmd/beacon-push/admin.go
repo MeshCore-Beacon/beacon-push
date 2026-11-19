@@ -25,6 +25,7 @@ const adminUsage = `usage: beacon-push admin <command>
   unsuspend <push id>                    let it send again
   ban <push id>                          stop it for good and refuse its email
   set-quota <push id> <per min> <per day>   override its limits; 0 0 restores its tier
+  delete <push id>                       remove it, its devices and its history for good; its email is not banned
   backup <file>                          write a consistent copy of the database to a new file
 
 The database is PUSH_DATABASE_PATH (default /data/beacon-push.db).`
@@ -115,6 +116,22 @@ func runAdmin(ctx context.Context, st *store.Store, args []string, out io.Writer
 			return err
 		}
 		fmt.Fprintf(out, "%s is now %s\n", i.ID, status)
+		return nil
+	case "delete":
+		if err := need(1); err != nil {
+			return err
+		}
+		i, err := lookup(ctx, st, args[1])
+		if err != nil {
+			return err
+		}
+		if err := st.DeleteInstance(ctx, i.ID); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return fmt.Errorf("no server %s", i.ID)
+			}
+			return err
+		}
+		fmt.Fprintf(out, "deleted %s (%s, %s)\n", i.ID, i.Name, i.Email)
 		return nil
 	case "backup":
 		if err := need(1); err != nil {

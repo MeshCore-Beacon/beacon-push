@@ -233,8 +233,12 @@ docker exec beacon-push beacon-push admin suspend <push id>
 docker exec beacon-push beacon-push admin unsuspend <push id>
 docker exec beacon-push beacon-push admin ban <push id>
 docker exec beacon-push beacon-push admin set-quota <push id> <per minute> <per day>
+docker exec beacon-push beacon-push admin delete <push id>
 docker exec beacon-push beacon-push admin backup /data/backup.db
 ```
+
+`delete` removes a server for good, with its devices, send log and usage. Its
+email is not banned and can register a server again.
 
 A server that addresses too many live device handles that aren't its own
 (50 in an hour, or more than 20% of at least 100 live handles in an hour) is

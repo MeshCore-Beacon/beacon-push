@@ -467,3 +467,58 @@ func TestMigrationKeepsHandles(t *testing.T) {
 		t.Fatalf("handles outlived their server: %v", err)
 	}
 }
+
+func TestDeleteInstance(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	for _, i := range []Instance{inst("inst_a", "op@x.org"), inst("inst_b", "op@x.org"), inst("inst_c", "c@x.org")} {
+		if err := s.CreateInstance(ctx, i, 2); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, id := range []string{"inst_a", "inst_c"} {
+		if _, err := s.UpsertHandle(ctx, "h_"+id, id, "android", "tok", "", []byte("s"), t0); err != nil {
+			t.Fatal(err)
+		}
+		r := Reservation{MessageID: "m_" + id, InstanceID: id, Handle: "h_" + id, At: t0, Size: 1, CiphertextSHA256: []byte("c"),
+			InstancePerDay: 10, GlobalPerDay: 10, HandlePerDay: 10}
+		if out, _, err := s.Reserve(ctx, r); err != nil || out != Reserved {
+			t.Fatalf("reserve %s: %v %v", id, out, err)
+		}
+		if err := s.BumpUsage(ctx, id, t0, UsageRateLimited); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.CreateInstance(ctx, inst("inst_d", "op@x.org"), 2); !errors.Is(err, ErrLimit) {
+		t.Fatalf("third server for one email: %v", err)
+	}
+
+	if err := s.DeleteInstance(ctx, "inst_a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Instance(ctx, "inst_a"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("instance still there: %v", err)
+	}
+	for _, q := range []string{`SELECT count(*) FROM handles WHERE instance_id = ?`, `SELECT count(*) FROM send_log WHERE instance_id = ?`,
+		`SELECT count(*) FROM usage_daily WHERE instance_id = ?`} {
+		for id, want := range map[string]int{"inst_a": 0, "inst_c": 1} {
+			var n int
+			if err := s.DB().QueryRowContext(ctx, q, id).Scan(&n); err != nil || n != want {
+				t.Errorf("%s [%s]: %d rows, want %d (%v)", q, id, n, want, err)
+			}
+		}
+	}
+	if n, _ := s.CountInstancesByEmail(ctx, "op@x.org"); n != 1 {
+		t.Fatalf("email still holds %d servers", n)
+	}
+	if err := s.CreateInstance(ctx, inst("inst_d", "op@x.org"), 2); err != nil {
+		t.Fatalf("freed slot not usable: %v", err)
+	}
+	var bans int
+	if err := s.DB().QueryRowContext(ctx, `SELECT count(*) FROM banned_emails`).Scan(&bans); err != nil || bans != 0 {
+		t.Fatalf("ban list has %d rows (%v)", bans, err)
+	}
+	if err := s.DeleteInstance(ctx, "inst_a"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("second delete: %v", err)
+	}
+}

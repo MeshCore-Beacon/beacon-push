@@ -72,7 +72,23 @@ func TestAdminCommands(t *testing.T) {
 	if _, err := run("backup", copyPath); err == nil {
 		t.Fatal("backup must not overwrite a file")
 	}
-	for _, bad := range [][]string{{"show"}, {"show", "inst_nope"}, {"set-quota", "inst_abc", "x", "1"}, {"frobnicate"}} {
+	if err := st.CreateInstance(ctx, store.Instance{ID: "inst_del", Name: "Gone", Email: "gone@example.org", SecretHash: []byte("h"),
+		TermsVersion: 1, CreatedAt: store.Ms(now)}, 2); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := run("delete", "inst_del"); err != nil || !strings.Contains(out, "deleted inst_del") {
+		t.Fatalf("delete: %v\n%s", err, out)
+	}
+	if _, err := st.Instance(ctx, "inst_del"); err == nil {
+		t.Fatal("delete left the server")
+	}
+	if banned, _ := st.EmailBanned(ctx, relay.EmailHash("gone@example.org")); banned {
+		t.Fatal("delete must not ban the email")
+	}
+	if _, err := run("delete", "inst_del"); err == nil || !strings.Contains(err.Error(), "no server inst_del") {
+		t.Fatalf("delete of unknown id: %v", err)
+	}
+	for _, bad := range [][]string{{"show"}, {"show", "inst_nope"}, {"set-quota", "inst_abc", "x", "1"}, {"delete"}, {"frobnicate"}} {
 		if _, err := run(bad...); err == nil {
 			t.Errorf("%v accepted", bad)
 		}

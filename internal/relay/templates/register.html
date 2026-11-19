@@ -1,31 +1,35 @@
 {{template "head" "Register a server"}}
 <h1>Register a server</h1>
-<p>You get a Push ID and a Push secret for your beacon-server's config. We email you a link to confirm first.
-Each email address can register up to two servers.</p>
+<p class="lead">We'll email you a link to your Push ID and secret. Up to two servers per email.</p>
 {{template "error" .Error}}
 <form method="post" action="/register">
+<div class="field">
 <label for="name">Server name</label>
-<input id="name" name="name" required maxlength="40" value="{{.Form.Name}}" placeholder="Ottawa Mesh">
-<p class="hint">Shown on every notification your server sends.</p>
+<input id="name" name="name" required maxlength="40" value="{{.Form.Name}}" placeholder="Ottawa Mesh" aria-describedby="name-hint">
+<p class="hint" id="name-hint">Shown on every notification.</p>
+</div>
 
+<div class="field">
 <label for="email">Your email</label>
-<input id="email" name="email" type="email" required maxlength="254" value="{{.Form.Email}}" autocomplete="email">
-<p class="hint">For the confirmation link and anything we need to tell you about this server. Not shown to anyone.</p>
+<input id="email" name="email" type="email" required maxlength="254" value="{{.Form.Email}}" autocomplete="email" aria-describedby="email-hint">
+<p class="hint" id="email-hint">Only for the link and notices about this server.</p>
+</div>
 
-<label for="url">Public URL of your server <span class="optional">(optional)</span></label>
-<input id="url" name="url" type="url" maxlength="200" value="{{.Form.URL}}" placeholder="https://beacon.example.org">
-<p class="hint">With a public URL the relay checks daily that the server is yours. beacon-server answers the check
-by itself, nothing to set up. A server that passes gets the verified tier: {{.Tiers.VerifiedPerMinute}} notifications a
-minute and {{.Tiers.VerifiedPerDay}} a day instead of {{.Tiers.EmailPerMinute}} and {{.Tiers.EmailPerDay}}.</p>
+<div class="field">
+<label for="url">Public URL <span class="optional">(optional)</span></label>
+<input id="url" name="url" type="url" maxlength="200" value="{{.Form.URL}}" placeholder="https://beacon.example.org" aria-describedby="url-hint">
+<p class="hint" id="url-hint">Raises your limits from {{.Tiers.EmailPerMinute}} to {{.Tiers.VerifiedPerMinute}} a minute and
+{{.Tiers.EmailPerDay}} to {{.Tiers.VerifiedPerDay}} a day, once a daily check confirms the server is yours.</p>
+</div>
 
 <div class="trap" aria-hidden="true">
 <label for="website">Leave this empty</label>
 <input id="website" name="website" tabindex="-1" autocomplete="off">
 </div>
 
-<label class="check"><input type="checkbox" name="terms" required> I accept the <a href="/terms">terms</a> and
-have read the <a href="/privacy">privacy notice</a>.</label>
+<label class="check"><input type="checkbox" name="terms" required> <span>I accept the <a href="/terms">terms</a> and
+have read the <a href="/privacy">privacy notice</a>.</span></label>
 
-<button type="submit">Send the confirmation link</button>
+<button type="submit">Send link</button>
 </form>
 {{template "foot"}}

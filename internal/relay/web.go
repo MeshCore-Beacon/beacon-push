@@ -82,7 +82,7 @@ type registerForm struct {
 }
 
 type registered struct {
-	PushID, Secret, Name, URL, Server string
+	PushID, Secret, Name, URL string
 }
 
 func (s *Server) render(w http.ResponseWriter, status int, name string, data pageData) {
@@ -308,8 +308,7 @@ func (s *Server) verify(w http.ResponseWriter, r *http.Request) {
 	s.log.Info("server registered", "component", "web", "push_id", inst.ID, "has_url", inst.URL != "")
 	go s.notifyAdmin(ctx, "New push server: "+inst.Name,
 		"Push ID: "+inst.ID+"\nName: "+inst.Name+"\nEmail: "+inst.Email+"\nURL: "+orNone(inst.URL)+"\nIP: "+inst.CreatedIP+"\n")
-	s.render(w, http.StatusOK, "verified", pageData{Result: &registered{PushID: inst.ID, Secret: secret, Name: inst.Name, URL: inst.URL,
-		Server: s.cfg.PublicURL.String()}})
+	s.render(w, http.StatusOK, "verified", pageData{Result: &registered{PushID: inst.ID, Secret: secret, Name: inst.Name, URL: inst.URL}})
 }
 
 func orNone(s string) string {

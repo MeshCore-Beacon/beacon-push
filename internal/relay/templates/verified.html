@@ -1,30 +1,28 @@
 {{template "head" "Your Push ID"}}
 <h1>{{.Result.Name}} is registered</h1>
-<p class="warning"><strong>Save the Push secret now.</strong> It is shown only on this page. If you lose it, register
-the server again.</p>
+<p class="warning">Copy the secret now. It won't be shown again.</p>
 
-<h2>config.yaml</h2>
-<pre>alerts:
+<div class="code">
+<div class="code-head"><span>config.yaml</span><button type="button" class="copy" data-copy="config" hidden>Copy</button></div>
+<pre id="config">alerts:
   push:
     enabled: true
     id: {{.Result.PushID}}</pre>
+</div>
 
-<h2>.env</h2>
-<pre>BEACON_PUSH_SECRET={{.Result.Secret}}</pre>
+<div class="code">
+<div class="code-head"><span>.env</span><button type="button" class="copy" data-copy="env" hidden>Copy</button></div>
+<pre id="env">BEACON_PUSH_SECRET={{.Result.Secret}}</pre>
+</div>
 
-<p>Restart beacon-server. At startup it logs that push notifications go through this relay, and which limits
-apply.</p>
+<p>Restart beacon-server.</p>
 {{if .Result.URL}}
-<p>The relay checks <code>{{.Result.URL}}/.well-known/beacon-push</code> daily. beacon-server answers it while push
-is on. That path must reach beacon-server: if a reverse proxy sits in front, route <code>/.well-known/beacon-push</code>
-to beacon-server, with no redirects. When the check passes, your limits go from the email tier
-({{.Tiers.EmailPerMinute}} a minute, {{.Tiers.EmailPerDay}} a day) to the verified tier ({{.Tiers.VerifiedPerMinute}} a
-minute, {{.Tiers.VerifiedPerDay}} a day).</p>
+<p class="hint">{{.Tiers.EmailPerMinute}} a minute and {{.Tiers.EmailPerDay}} a day until the daily check passes, then
+{{.Tiers.VerifiedPerMinute}} and {{.Tiers.VerifiedPerDay}}. Behind a proxy, route <code>/.well-known/beacon-push</code>
+to beacon-server.</p>
 {{else}}
-<p>This server is on the email tier: {{.Tiers.EmailPerMinute}} notifications a minute and {{.Tiers.EmailPerDay}} a day.
-Register it with its public URL to get the verified tier ({{.Tiers.VerifiedPerMinute}} a minute,
-{{.Tiers.VerifiedPerDay}} a day).</p>
+<p class="hint">{{.Tiers.EmailPerMinute}} a minute and {{.Tiers.EmailPerDay}} a day. Register with a public URL for
+{{.Tiers.VerifiedPerMinute}} and {{.Tiers.VerifiedPerDay}}.</p>
 {{end}}
-<p class="hint">Leave <code>alerts.push.server</code> unset: it defaults to {{.Result.Server}}, the official push
-server, and the Beacon app only receives notifications from it.</p>
+<script src="/static/copy.js"></script>
 {{template "foot"}}

@@ -1,16 +1,14 @@
-{{template "head" "Push notifications for Beacon servers"}}
-<h1>Push notifications for Beacon servers</h1>
-<p>The Beacon app only receives push notifications sent through this relay, run by the MeshCore Beacon project.
-If you run your own <a href="https://github.com/MeshCore-Beacon/beacon-server">beacon-server</a>, register it here
-to send its alerts to your users' phones.</p>
+{{template "head" "Push for Beacon servers"}}
+<h1>Push for Beacon servers</h1>
+<p class="lead">The Beacon app only accepts notifications sent through this relay. Run your own
+<a href="https://github.com/MeshCore-Beacon/beacon-server">beacon-server</a>? Register it so its alerts reach your
+users.</p>
 <h2>What the relay sees</h2>
 <ul>
-<li>Which server sent each notification. Every notification shows your server's name.</li>
-<li>When it was sent, which device handle it went to, and its size.</li>
-<li>Not what it says. Notifications are encrypted between your server and the app.</li>
+<li>Which server sent each notification, and when.</li>
+<li>The device it went to, and the size.</li>
 </ul>
-<p>Each server has rate limits, and the relay tracks usage to catch abuse. Servers that abuse it are suspended or
-banned.</p>
+<p>It can't read them: they're encrypted between your server and the app.</p>
 <p><a class="button" href="/register">Register a server</a></p>
 <h2>Keeping it running</h2>
 <p>I host this relay in the cloud so every Beacon user gets notifications, free for you and your users. If it's

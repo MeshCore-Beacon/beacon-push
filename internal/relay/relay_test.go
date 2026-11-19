@@ -592,7 +592,8 @@ func TestChallengeClientRefusesPrivateAddresses(t *testing.T) {
 
 func TestPages(t *testing.T) {
 	h := newHarness(t)
-	for _, p := range []string{"/", "/register", "/verify", "/terms", "/privacy", "/static/site.css", "/static/verify.js", "/healthz"} {
+	for _, p := range []string{"/", "/register", "/verify", "/terms", "/privacy", "/static/site.css", "/static/verify.js", "/static/copy.js",
+		"/static/favicon.svg", "/static/fonts/inter-latin-400-normal.woff2", "/favicon.ico", "/healthz"} {
 		resp, err := http.Get(h.srv.URL + p)
 		if err != nil {
 			t.Fatal(err)
@@ -648,8 +649,8 @@ func TestClientIPTakesTheProxysEntry(t *testing.T) {
 
 func TestPagesShowTierLimits(t *testing.T) {
 	h := newHarness(t)
-	verified := fmt.Sprintf("verified tier: %s notifications a minute and %s a day instead of %s and %s",
-		thousands(VerifiedTierPerMinute), thousands(VerifiedTierPerDay), thousands(EmailTierPerMinute), thousands(EmailTierPerDay))
+	m, d, vm, vd := thousands(EmailTierPerMinute), thousands(EmailTierPerDay), thousands(VerifiedTierPerMinute), thousands(VerifiedTierPerDay)
+	verified := fmt.Sprintf("Raises your limits from %s to %s a minute and %s to %s a day", m, vm, d, vd)
 	resp, err := http.Get(h.srv.URL + "/register")
 	if err != nil {
 		t.Fatal(err)
@@ -671,20 +672,17 @@ func TestPagesShowTierLimits(t *testing.T) {
 		}
 		return strings.Join(strings.Fields(body), " ")
 	}
-	emailTier := fmt.Sprintf("email tier (%s a minute, %s a day)", thousands(EmailTierPerMinute), thousands(EmailTierPerDay))
-	verifiedTier := fmt.Sprintf("verified tier (%s a minute, %s a day)", thousands(VerifiedTierPerMinute), thousands(VerifiedTierPerDay))
 	page := verifiedPage("u@example.org", "https://beacon.example.org")
-	for _, want := range []string{"https://beacon.example.org/.well-known/beacon-push</code> daily", "no redirects", emailTier, verifiedTier} {
+	withURL := fmt.Sprintf("%s a minute and %s a day until the daily check passes, then %s and %s.", m, d, vm, vd)
+	for _, want := range []string{withURL, "route <code>/.well-known/beacon-push</code> to beacon-server"} {
 		if !strings.Contains(page, want) {
 			t.Errorf("verified page with a URL lacks %q:\n%s", want, page)
 		}
 	}
 	page = verifiedPage("n@example.org", "")
-	onEmail := fmt.Sprintf("on the email tier: %s notifications a minute and %s a day", thousands(EmailTierPerMinute), thousands(EmailTierPerDay))
-	for _, want := range []string{onEmail, verifiedTier} {
-		if !strings.Contains(page, want) {
-			t.Errorf("verified page without a URL lacks %q:\n%s", want, page)
-		}
+	noURL := fmt.Sprintf("%s a minute and %s a day. Register with a public URL for %s and %s.", m, d, vm, vd)
+	if !strings.Contains(page, noURL) {
+		t.Errorf("verified page without a URL lacks %q:\n%s", noURL, page)
 	}
 	if strings.Contains(page, ".well-known") {
 		t.Error("verified page without a URL talks about the check path")

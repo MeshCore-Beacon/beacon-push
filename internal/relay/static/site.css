@@ -1,32 +1,86 @@
 /* Copyright 2026 Beacon Contributors. SPDX-License-Identifier: AGPL-3.0-or-later */
-:root { color-scheme: light dark; --fg: #1b1f24; --muted: #5b6470; --bg: #f7f7f5; --card: #fff; --line: #d9dcdf;
-  --accent: #0b6e4f; --warn: #8a5a00; --err: #a1261c; }
-@media (prefers-color-scheme: dark) {
-  :root { --fg: #e8eaed; --muted: #9aa3ad; --bg: #14171a; --card: #1c2024; --line: #30363c; --accent: #4cc38a;
-    --warn: #e0b050; --err: #f08a80; }
+
+/* Fonts are self-hosted latin subsets under the SIL OFL 1.1, see fonts/*-OFL.txt. */
+@font-face { font-family: Inter; font-weight: 400; font-display: swap; src: url(fonts/inter-latin-400-normal.woff2) format("woff2"); }
+@font-face { font-family: Inter; font-weight: 600; font-display: swap; src: url(fonts/inter-latin-600-normal.woff2) format("woff2"); }
+@font-face { font-family: Inter; font-weight: 700; font-display: swap; src: url(fonts/inter-latin-700-normal.woff2) format("woff2"); }
+@font-face { font-family: "JetBrains Mono"; font-weight: 400; font-display: swap; src: url(fonts/jetbrains-mono-latin-400-normal.woff2) format("woff2"); }
+@font-face { font-family: "Chakra Petch"; font-weight: 500; font-display: swap; src: url(fonts/chakra-petch-latin-500-normal.woff2) format("woff2"); }
+
+:root {
+  color-scheme: light dark;
+  --fg: #1b1f24; --muted: #5d6670; --bg: #fafaf8; --field: #fff; --code: #f0f0ec; --line: #d6d9dc;
+  --accent: #0b6e4f; --on-accent: #fff; --warn: #b07400; --err: #a1261c;
+  --sans: Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 }
+@media (prefers-color-scheme: dark) {
+  :root { --fg: #e8eaed; --muted: #98a1ab; --bg: #121417; --field: #1a1d21; --code: #1c2024; --line: #333a41;
+    --accent: #4cc38a; --on-accent: #0b1a13; --warn: #e0b050; --err: #f08a80; }
+}
+
 * { box-sizing: border-box; }
-body { margin: 0; font: 16px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--fg); background: var(--bg); }
-header, main, footer { max-width: 40rem; margin: 0 auto; padding: 1rem 1.25rem; }
-header { padding-top: 1.5rem; }
-.brand { font-weight: 800; letter-spacing: .08em; color: var(--fg); text-decoration: none; }
-.brand span { font-weight: 500; letter-spacing: 0; color: var(--accent); }
-main { background: var(--card); border: 1px solid var(--line); border-radius: 10px; }
-h1 { font-size: 1.6rem; line-height: 1.25; margin: .25rem 0 1rem; }
-h2 { font-size: 1.05rem; margin: 1.5rem 0 .5rem; }
-a { color: var(--accent); }
-label { display: block; font-weight: 600; margin-top: 1.1rem; }
+[hidden] { display: none !important; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0 auto; max-width: 36.5rem; padding: 0 1.25rem; font: 1.0625rem/1.6 var(--sans); color: var(--fg);
+  background: var(--bg); -webkit-font-smoothing: antialiased; }
+
+header { padding: 1.75rem 0 0; }
+.brand { display: inline-flex; align-items: center; gap: .6rem; color: var(--fg); text-decoration: none; }
+.mark { color: var(--accent); flex: none; }
+.wordmark { font: 500 1.0625rem/1 "Chakra Petch", var(--sans); letter-spacing: .18em; }
+.product { font-weight: 600; color: var(--muted); }
+
+main { padding: 3.5rem 0 4.5rem; }
+h1 { font-size: clamp(2rem, 7vw, 2.625rem); font-weight: 700; line-height: 1.1; letter-spacing: -.025em;
+  margin: 0 0 1.25rem; text-wrap: balance; }
+h2 { font-size: 1.125rem; font-weight: 600; letter-spacing: -.01em; margin: 2.75rem 0 .5rem; }
+p, li { text-wrap: pretty; }
+p { margin: 0 0 1rem; }
+.lead { font-size: 1.1875rem; line-height: 1.55; }
+ul, ol { margin: 0 0 1rem; padding-left: 1.25rem; }
+li { margin: .35rem 0; padding-left: .2rem; }
+li::marker { color: var(--accent); }
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: .2em; }
+a:hover { text-decoration-thickness: 2px; }
+strong { font-weight: 600; }
+.hint { color: var(--muted); font-size: .9375rem; line-height: 1.5; }
+
+form { margin-top: 2.25rem; }
+.field { margin-bottom: 1.75rem; }
+label { display: block; font-weight: 600; margin-bottom: .45rem; }
 .optional { font-weight: 400; color: var(--muted); }
-input:not([type=checkbox]) { width: 100%; font: inherit; padding: .55rem .65rem; margin-top: .3rem; border: 1px solid var(--line);
-  border-radius: 6px; background: var(--bg); color: var(--fg); }
-input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
-.check { font-weight: 400; margin-top: 1.4rem; }
-.hint { color: var(--muted); font-size: .9rem; margin: .3rem 0 0; }
-button, .button { display: inline-block; margin-top: 1.4rem; font: inherit; font-weight: 600; padding: .6rem 1.1rem; border: 0;
-  border-radius: 6px; background: var(--accent); color: #fff; text-decoration: none; cursor: pointer; }
-pre, code { font: .9rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
-pre { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: .75rem; overflow-x: auto; user-select: all; }
-.error { color: var(--err); font-weight: 600; }
-.warning { color: var(--warn); }
+input:not([type=checkbox]) { display: block; width: 100%; font: inherit; padding: .7rem .85rem; border: 1px solid var(--line);
+  border-radius: 8px; background: var(--field); color: var(--fg); }
+input::placeholder { color: var(--muted); opacity: .7; }
+input:focus { border-color: var(--accent); outline: 3px solid color-mix(in srgb, var(--accent) 25%, transparent); outline-offset: 0; }
+.field .hint { margin: .45rem 0 0; }
+.check { display: flex; gap: .65rem; align-items: baseline; font-weight: 400; margin: 2rem 0 0; }
+.check input { accent-color: var(--accent); width: 1.05rem; height: 1.05rem; flex: none; position: relative; top: .15rem; }
+
+button, .button { display: inline-block; margin-top: 2rem; font: inherit; font-weight: 600; padding: .75rem 1.35rem;
+  border: 0; border-radius: 8px; background: var(--accent); color: var(--on-accent); text-decoration: none; cursor: pointer; }
+button:hover, .button:hover { background: color-mix(in srgb, var(--accent) 86%, var(--fg)); }
+button:focus-visible, .button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+main > p:has(> .button) { margin-top: 2.5rem; }
+main > p > .button { margin-top: 0; }
+
+code, pre { font-family: var(--mono); }
+code { font-size: .875em; background: var(--code); padding: .1em .35em; border-radius: 4px; overflow-wrap: anywhere; }
+.code { margin: 1.75rem 0; }
+.code-head { display: flex; justify-content: space-between; align-items: center; min-height: 2rem; margin-bottom: .35rem;
+  font: .8125rem/1 var(--mono); color: var(--muted); }
+pre { margin: 0; padding: 1rem 1.1rem; background: var(--code); border-radius: 8px; font-size: .875rem; line-height: 1.65;
+  white-space: pre-wrap; overflow-wrap: anywhere; user-select: all; }
+button.copy { margin: 0; padding: .35rem .7rem; font: 500 .8125rem/1 var(--sans); background: none; color: var(--fg);
+  border: 1px solid var(--line); border-radius: 6px; }
+button.copy:hover { background: var(--code); }
+
+.warning, .error { border-left: 3px solid; padding: .1rem 0 .1rem .9rem; margin: 1.5rem 0; font-weight: 600; }
+.warning { border-color: var(--warn); }
+.error { border-color: var(--err); color: var(--err); }
 .trap { position: absolute; left: -10000px; width: 1px; height: 1px; overflow: hidden; }
-footer { color: var(--muted); font-size: .85rem; }
+
+footer { border-top: 1px solid var(--line); padding: 1.5rem 0 2.5rem; color: var(--muted); font-size: .875rem; }
+footer a { color: inherit; text-decoration: none; }
+footer a:hover { color: var(--fg); text-decoration: underline; }

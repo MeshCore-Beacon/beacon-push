@@ -152,6 +152,7 @@ func (s *Server) Handler() http.Handler {
 	r.Get("/verify", s.page("verify"))
 	r.Post("/verify", s.verify)
 	r.Handle("/static/*", staticFiles())
+	r.Get("/favicon.ico", favicon)
 
 	r.Route("/v1", func(r chi.Router) {
 		r.Post("/hello", s.withInstance(s.hello))
@@ -170,7 +171,7 @@ func securityHeaders(next http.Handler) http.Handler {
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("X-Frame-Options", "DENY")
-		h.Set("Content-Security-Policy", "default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+		h.Set("Content-Security-Policy", "default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self'; font-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
 		next.ServeHTTP(w, r)
 	})
 }

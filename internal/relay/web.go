@@ -34,7 +34,22 @@ var pages = template.Must(template.ParseFS(templateFS, "templates/*.html"))
 
 func staticFiles() http.Handler {
 	sub, _ := fs.Sub(staticFS, "static")
-	return http.StripPrefix("/static/", http.FileServer(http.FS(sub)))
+	files := http.StripPrefix("/static/", http.FileServer(http.FS(sub)))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Fonts never change; the rest may on any deploy.
+		if strings.HasPrefix(r.URL.Path, "/static/fonts/") {
+			w.Header().Set("Cache-Control", "public, max-age=2592000")
+		}
+		files.ServeHTTP(w, r)
+	})
+}
+
+// favicon answers browsers that ask for /favicon.ico without reading the page's icon link.
+func favicon(w http.ResponseWriter, _ *http.Request) {
+	b, _ := staticFS.ReadFile("static/favicon.svg")
+	w.Header().Set("Content-Type", "image/svg+xml")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	_, _ = w.Write(b)
 }
 
 // pageData is what every page template gets.

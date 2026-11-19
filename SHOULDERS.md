@@ -16,6 +16,15 @@ projects that make this possible. Add new dependencies here in the PR that intro
 - [disposable-email-domains](https://github.com/disposable-email-domains/disposable-email-domains): the CC0
   blocklist of throwaway email domains, vendored in `internal/disposable/list.txt`
 
+## Fonts
+
+Self-hosted latin subsets from [Fontsource](https://fontsource.org/), under the SIL Open Font License 1.1. The
+license texts sit next to the files in `internal/relay/static/fonts/`.
+
+- [Inter](https://github.com/rsms/inter): the text on the relay's web pages
+- [JetBrains Mono](https://github.com/JetBrains/JetBrainsMono): IDs and config snippets
+- [Chakra Petch](https://github.com/m4rc1e/Chakra-Petch): the Beacon wordmark
+
 ## Services
 
 - [Apple Push Notification service](https://developer.apple.com/documentation/usernotifications): delivery to iOS

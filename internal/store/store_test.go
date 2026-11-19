@@ -522,3 +522,23 @@ func TestDeleteInstance(t *testing.T) {
 		t.Fatalf("second delete: %v", err)
 	}
 }
+
+func TestInstancesByEmailAndSetSecret(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	_ = s.CreateInstance(ctx, inst("inst_a", "a@x.org"), 2)
+	_ = s.CreateInstance(ctx, inst("inst_b", "b@x.org"), 2)
+	list, err := s.InstancesByEmail(ctx, "a@x.org")
+	if err != nil || len(list) != 1 || list[0].ID != "inst_a" {
+		t.Fatalf("%+v %v", list, err)
+	}
+	if err := s.SetSecret(ctx, "inst_a", []byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if i, _ := s.Instance(ctx, "inst_a"); string(i.SecretHash) != "new" {
+		t.Fatalf("secret not set: %q", i.SecretHash)
+	}
+	if err := s.SetSecret(ctx, "inst_zz", []byte("x")); err != ErrNotFound {
+		t.Fatalf("unknown server: %v", err)
+	}
+}

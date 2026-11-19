@@ -1,0 +1,36 @@
+{{template "head" "Your servers"}}
+<h1>Your servers</h1>
+{{template "error" .Error}}
+{{if .Notice}}<p class="warning" role="status">{{.Notice}}</p>{{end}}
+{{if .Session}}
+<p class="lead">This page works for 15 minutes and one action.</p>
+{{range .Servers}}
+<section class="server">
+<h2>{{.Name}}</h2>
+<dl>
+<dt>Push ID</dt><dd><code>{{.PushID}}</code></dd>
+<dt>URL</dt><dd>{{if .URL}}{{.URL}}{{else}}none{{end}}</dd>
+<dt>Status</dt><dd>{{.Status}}, {{.Tier}} tier</dd>
+</dl>
+<form method="post" action="/manage/secret">
+<input type="hidden" name="session" value="{{$.Session}}">
+<input type="hidden" name="push_id" value="{{.PushID}}">
+<button type="submit">Get a new secret</button>
+<p class="hint">The old secret stops working at once. Devices and limits stay.</p>
+</form>
+<form method="post" action="/manage/remove">
+<input type="hidden" name="session" value="{{$.Session}}">
+<input type="hidden" name="push_id" value="{{.PushID}}">
+<label class="check"><input type="checkbox" name="confirm" required> <span>Remove {{.Name}}, its devices and its
+history for good.</span></label>
+<button type="submit" class="danger">Remove server</button>
+</form>
+</section>
+{{end}}
+{{else if not .Error}}
+<p class="lead">No servers are registered with this address any more.</p>
+<p><a class="button" href="/register">Register a server</a></p>
+{{else}}
+<p><a href="/manage">Ask for a new link</a></p>
+{{end}}
+{{template "foot"}}

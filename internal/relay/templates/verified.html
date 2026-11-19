@@ -1,5 +1,5 @@
 {{template "head" "Your Push ID"}}
-<h1>{{.Result.Name}} is registered</h1>
+{{if .Reset}}<h1>New secret for {{.Result.Name}}</h1>{{else}}<h1>{{.Result.Name}} is registered</h1>{{end}}
 <p class="warning">Copy the secret now. It won't be shown again.</p>
 
 <div class="code">
@@ -15,6 +15,11 @@
 <pre id="env">BEACON_PUSH_SECRET={{.Result.Secret}}</pre>
 </div>
 
+{{if .Reset}}
+<p>Put the new secret in .env and restart beacon-server. Until then its notifications are refused.</p>
+{{if .Result.URL}}<p class="hint">If a daily check runs first, the server drops to {{.Tiers.EmailPerMinute}} a minute
+until the next check passes.</p>{{end}}
+{{else}}
 <p>Restart beacon-server.</p>
 {{if .Result.URL}}
 <p class="hint">{{.Tiers.EmailPerMinute}} a minute and {{.Tiers.EmailPerDay}} a day until the daily check passes, then
@@ -24,5 +29,7 @@ to beacon-server.</p>
 <p class="hint">{{.Tiers.EmailPerMinute}} a minute and {{.Tiers.EmailPerDay}} a day. Register with a public URL for
 {{.Tiers.VerifiedPerMinute}} and {{.Tiers.VerifiedPerDay}}.</p>
 {{end}}
+{{end}}
+<p class="hint">Lose a secret later? <a href="/manage">Manage your servers</a>.</p>
 <script src="/static/copy.js"></script>
 {{template "foot"}}

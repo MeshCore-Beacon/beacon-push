@@ -59,6 +59,11 @@ type pageData struct {
 	Result *registered
 	Email  string
 	Tiers  tierText
+	// The manage pages.
+	Servers []managedServer
+	Session string
+	Notice  string
+	Reset   bool
 }
 
 // tierText is the tier limits as the pages show them, taken from the constants so the copy cannot drift.

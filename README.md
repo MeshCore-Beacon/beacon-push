@@ -51,6 +51,15 @@ Neither sees the other platform's traffic.
 
 Every device also has its own limits: 10 notifications a minute and 200 a day.
 
+### Lost secret or a slot back
+
+`/manage` takes the registered email and mails a link that works for an hour.
+It lists that email's servers for 15 minutes and one action: get a new Push
+secret (the old one stops working at once; the Push ID, devices and limits
+stay) or remove a server with its devices and history, which frees its slot.
+Every change mails a notice to the operator and the admin address. Banned
+servers and banned emails get nothing.
+
 ## API
 
 All bodies are JSON, at most 512 KiB (a bigger one gets `413 too_large`).

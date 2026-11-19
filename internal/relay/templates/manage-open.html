@@ -1,0 +1,15 @@
+{{template "head" "Manage your servers"}}
+<h1>Manage your servers</h1>
+{{template "error" .Error}}
+<form method="post" action="/manage/open">
+<input type="hidden" name="token" id="token">
+<noscript>
+<div class="field">
+<label for="token_manual">Paste everything after <code>#token=</code> in the link</label>
+<input id="token_manual" name="token_manual" autocomplete="off">
+</div>
+</noscript>
+<button type="submit">Show my servers</button>
+</form>
+<script src="/static/verify.js"></script>
+{{template "foot"}}

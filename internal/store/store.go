@@ -289,6 +289,24 @@ func (s *Store) Instances(ctx context.Context) ([]Instance, error) {
 	return out, rows.Err()
 }
 
+// InstancesByEmail lists the servers an email holds, oldest first.
+func (s *Store) InstancesByEmail(ctx context.Context, email string) ([]Instance, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+instanceCols+` FROM instances WHERE email = ? ORDER BY created_at`, email)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Instance
+	for rows.Next() {
+		i, err := scanInstance(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, i)
+	}
+	return out, rows.Err()
+}
+
 // DueForDomainCheck lists active servers with a URL whose domain was last checked before the time.
 func (s *Store) DueForDomainCheck(ctx context.Context, checkedBefore time.Time) ([]Instance, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+instanceCols+` FROM instances
@@ -338,6 +356,11 @@ func (s *Store) SuspendIfActive(ctx context.Context, id string) (bool, error) {
 		return false, nil
 	}
 	return err == nil, err
+}
+
+// SetSecret replaces a server's Push secret hash. The old secret stops working at once.
+func (s *Store) SetSecret(ctx context.Context, id string, secretHash []byte) error {
+	return s.exec1(ctx, `UPDATE instances SET secret_hash = ? WHERE id = ?`, secretHash, id)
 }
 
 // SetQuota overrides a server's limits; 0 restores the tier default.

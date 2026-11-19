@@ -592,7 +592,7 @@ func TestChallengeClientRefusesPrivateAddresses(t *testing.T) {
 
 func TestPages(t *testing.T) {
 	h := newHarness(t)
-	for _, p := range []string{"/", "/register", "/verify", "/terms", "/privacy", "/static/site.css", "/static/verify.js", "/static/copy.js",
+	for _, p := range []string{"/", "/register", "/verify", "/manage", "/manage/open", "/terms", "/privacy", "/static/site.css", "/static/verify.js", "/static/copy.js",
 		"/static/favicon.svg", "/static/fonts/inter-latin-400-normal.woff2", "/favicon.ico", "/healthz"} {
 		resp, err := http.Get(h.srv.URL + p)
 		if err != nil {

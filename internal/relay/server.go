@@ -44,24 +44,27 @@ const (
 	RegisterPerHourPerIP  = 3
 	LinkMailsPerHour      = 5 // per email address
 	VerifyPerHourPerIP    = 20
+	ManagePerHourPerIP    = 3
 	HandleCreatesPerHour  = 20 // per IP
 	HandleUpdatesPerHour  = 60 // per IP
 	DomainChecksPerHour   = 10 // per server, on request
 	HandleReviewThreshold = 1000
 
-	MaxBody           = 512 << 10 // 100 maximum-size items with room for JSON
-	MaxBatch          = 100
-	MaxCiphertext     = 2048
-	MaxCollapseKey    = 40
-	MaxClientID       = 64
-	MaxTTL            = 28 * 24 * time.Hour
-	DefaultTTL        = 24 * time.Hour
-	LinkLifetime      = 24 * time.Hour
-	DomainRecheck     = 24 * time.Hour
-	TermsVersion      = 1
-	harvestMinSends   = 100 // live handles in an hour before the ratio applies
-	harvestBadPercent = 20
-	harvestForeignMax = 50 // another server's live handles in an hour, whatever the ratio
+	MaxBody               = 512 << 10 // 100 maximum-size items with room for JSON
+	MaxBatch              = 100
+	MaxCiphertext         = 2048
+	MaxCollapseKey        = 40
+	MaxClientID           = 64
+	MaxTTL                = 28 * 24 * time.Hour
+	DefaultTTL            = 24 * time.Hour
+	LinkLifetime          = 24 * time.Hour
+	ManageLinkLifetime    = time.Hour
+	ManageSessionLifetime = 15 * time.Minute
+	DomainRecheck         = 24 * time.Hour
+	TermsVersion          = 1
+	harvestMinSends       = 100 // live handles in an hour before the ratio applies
+	harvestBadPercent     = 20
+	harvestForeignMax     = 50 // another server's live handles in an hour, whatever the ratio
 )
 
 // Send timing. A batch answers within about BatchDeadline plus one provider call (10 s).
@@ -151,6 +154,12 @@ func (s *Server) Handler() http.Handler {
 	r.Post("/register", s.register)
 	r.Get("/verify", s.page("verify"))
 	r.Post("/verify", s.verify)
+	r.Get("/manage", s.page("manage"))
+	r.Post("/manage", s.manage)
+	r.Get("/manage/open", s.page("manage-open"))
+	r.Post("/manage/open", s.manageOpen)
+	r.Post("/manage/secret", s.manageSecret)
+	r.Post("/manage/remove", s.manageRemove)
 	r.Handle("/static/*", staticFiles())
 	r.Get("/favicon.ico", favicon)
 

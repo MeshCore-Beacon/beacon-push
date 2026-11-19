@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/mail"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -42,6 +43,23 @@ type pageData struct {
 	Form   registerForm
 	Result *registered
 	Email  string
+	Tiers  tierText
+}
+
+// tierText is the tier limits as the pages show them, taken from the constants so the copy cannot drift.
+type tierText struct {
+	EmailPerMinute, EmailPerDay, VerifiedPerMinute, VerifiedPerDay string
+}
+
+var tiers = tierText{thousands(EmailTierPerMinute), thousands(EmailTierPerDay), thousands(VerifiedTierPerMinute), thousands(VerifiedTierPerDay)}
+
+// thousands writes n with comma separators, like 10,000.
+func thousands(n int) string {
+	s := strconv.Itoa(n)
+	for i := len(s) - 3; i > 0; i -= 3 {
+		s = s[:i] + "," + s[i:]
+	}
+	return s
 }
 
 type registerForm struct {
@@ -56,6 +74,7 @@ func (s *Server) render(w http.ResponseWriter, status int, name string, data pag
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
+	data.Tiers = tiers
 	if err := pages.ExecuteTemplate(w, name+".html", data); err != nil {
 		s.log.Error("page not rendered", "component", "web", "page", name, "err", err)
 	}

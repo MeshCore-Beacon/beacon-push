@@ -200,6 +200,9 @@ seconds. beacon-server answers:
 ```
 
 A match proves that the host at that URL holds the Push secret.
+beacon-server answers by itself while push is on; there is nothing to set up.
+If a reverse proxy sits in front of it, route `/.well-known/beacon-push` to
+beacon-server, with no redirects.
 
 ## Running the relay
 

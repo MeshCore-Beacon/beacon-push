@@ -14,7 +14,9 @@ Each email address can register up to two servers.</p>
 
 <label for="url">Public URL of your server <span class="optional">(optional)</span></label>
 <input id="url" name="url" type="url" maxlength="200" value="{{.Form.URL}}" placeholder="https://beacon.example.org">
-<p class="hint">If your server is reachable from the internet, it proves it owns this address and gets higher limits.</p>
+<p class="hint">With a public URL the relay checks daily that the server is yours. beacon-server answers the check
+by itself, nothing to set up. A server that passes gets the verified tier: {{.Tiers.VerifiedPerMinute}} notifications a
+minute and {{.Tiers.VerifiedPerDay}} a day instead of {{.Tiers.EmailPerMinute}} and {{.Tiers.EmailPerDay}}.</p>
 
 <div class="trap" aria-hidden="true">
 <label for="website">Leave this empty</label>

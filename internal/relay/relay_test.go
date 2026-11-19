@@ -645,3 +645,51 @@ func TestClientIPTakesTheProxysEntry(t *testing.T) {
 		t.Fatalf("without TrustProxy: %s", ip)
 	}
 }
+
+func TestPagesShowTierLimits(t *testing.T) {
+	h := newHarness(t)
+	verified := fmt.Sprintf("verified tier: %s notifications a minute and %s a day instead of %s and %s",
+		thousands(VerifiedTierPerMinute), thousands(VerifiedTierPerDay), thousands(EmailTierPerMinute), thousands(EmailTierPerDay))
+	resp, err := http.Get(h.srv.URL + "/register")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if page := strings.Join(strings.Fields(string(body)), " "); !strings.Contains(page, verified) {
+		t.Errorf("register page has no tier limits:\n%s", page)
+	}
+
+	verifiedPage := func(email, serverURL string) string {
+		t.Helper()
+		h.form("/register", h.nextIP(), registration("A", email, serverURL))
+		msgs := h.mail.Messages()
+		m := linkRe.FindStringSubmatch(msgs[len(msgs)-1].Text)
+		code, body := h.form("/verify", h.nextIP(), url.Values{"token": {m[1]}})
+		if code != 200 {
+			t.Fatalf("verify %d", code)
+		}
+		return strings.Join(strings.Fields(body), " ")
+	}
+	emailTier := fmt.Sprintf("email tier (%s a minute, %s a day)", thousands(EmailTierPerMinute), thousands(EmailTierPerDay))
+	verifiedTier := fmt.Sprintf("verified tier (%s a minute, %s a day)", thousands(VerifiedTierPerMinute), thousands(VerifiedTierPerDay))
+	page := verifiedPage("u@example.org", "https://beacon.example.org")
+	for _, want := range []string{"https://beacon.example.org/.well-known/beacon-push</code> daily", "no redirects", emailTier, verifiedTier} {
+		if !strings.Contains(page, want) {
+			t.Errorf("verified page with a URL lacks %q:\n%s", want, page)
+		}
+	}
+	page = verifiedPage("n@example.org", "")
+	onEmail := fmt.Sprintf("on the email tier: %s notifications a minute and %s a day", thousands(EmailTierPerMinute), thousands(EmailTierPerDay))
+	for _, want := range []string{onEmail, verifiedTier} {
+		if !strings.Contains(page, want) {
+			t.Errorf("verified page without a URL lacks %q:\n%s", want, page)
+		}
+	}
+	if strings.Contains(page, ".well-known") {
+		t.Error("verified page without a URL talks about the check path")
+	}
+	if thousands(10000) != "10,000" || thousands(500) != "500" || thousands(1234567) != "1,234,567" {
+		t.Error("thousands")
+	}
+}

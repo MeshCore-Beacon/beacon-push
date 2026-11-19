@@ -64,6 +64,10 @@ button:hover, .button:hover { background: color-mix(in srgb, var(--accent) 86%, 
 button:focus-visible, .button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 main > p:has(> .button) { margin-top: 2.5rem; }
 main > p > .button { margin-top: 0; }
+.actions { display: flex; flex-wrap: wrap; gap: .75rem; }
+.button-outline { background: transparent; color: var(--accent); box-shadow: inset 0 0 0 1.5px var(--accent); }
+.button-outline:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+@media (max-width: 26rem) { .actions .button { flex: 1 1 100%; text-align: center; } }
 
 code, pre { font-family: var(--mono); }
 code { font-size: .875em; background: var(--code); padding: .1em .35em; border-radius: 4px; overflow-wrap: anywhere; }

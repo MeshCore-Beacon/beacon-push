@@ -26,6 +26,9 @@ type managedServer struct {
 	// Usage, already formatted with thousands separators.
 	Devices, SentToday, PerMinute, PerDay  string
 	WeekSent, WeekRateLimited, WeekInvalid string
+	// For the meter.
+	TodayN, PerDayN int
+	NearLimit       bool
 }
 
 // usageWindow is how many days, today included, the usage line on the manage list covers.
@@ -56,7 +59,8 @@ func (s *Server) managed(ctx context.Context, i store.Instance) (managedServer, 
 	t := TierFor(i)
 	return managedServer{PushID: i.ID, Name: i.Name, URL: i.URL, Status: i.Status, Tier: t.Name,
 		Devices: thousands(devices), SentToday: thousands(today), PerMinute: thousands(t.PerMinute), PerDay: thousands(t.PerDay),
-		WeekSent: thousands(sent), WeekRateLimited: thousands(limited), WeekInvalid: thousands(invalid)}, nil
+		WeekSent: thousands(sent), WeekRateLimited: thousands(limited), WeekInvalid: thousands(invalid),
+		TodayN: today, PerDayN: t.PerDay, NearLimit: today*5 >= t.PerDay*4}, nil
 }
 
 const somethingWrong = "Something went wrong. Try again later."

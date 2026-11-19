@@ -61,7 +61,8 @@ func TestManageNewSecret(t *testing.T) {
 	if !strings.Contains(list, id) {
 		t.Fatalf("server not listed: %s", list)
 	}
-	for _, want := range []string{"1 registered phone", "1 of 500 sent", "30 a minute, 500 a day (email tier)", "1 sent, 0 rate limited"} {
+	for _, want := range []string{"<strong>1</strong> sent today <span>of 500</span>", `<progress value="1" max="500">`,
+		"Up to 30 a minute on the email tier", "<dt>Phones</dt><dd>1</dd>", "<dt>Sent in 7 days</dt><dd>1</dd>"} {
 		if !strings.Contains(list, want) {
 			t.Errorf("usage %q missing", want)
 		}

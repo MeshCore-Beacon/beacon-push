@@ -23,6 +23,40 @@ const (
 // managedServer is one row on the manage list.
 type managedServer struct {
 	PushID, Name, URL, Status, Tier string
+	// Usage, already formatted with thousands separators.
+	Devices, SentToday, PerMinute, PerDay  string
+	WeekSent, WeekRateLimited, WeekInvalid string
+}
+
+// usageWindow is how many days, today included, the usage line on the manage list covers.
+const usageWindow = 7
+
+// managed builds a list row with the server's usage. Today's count is the one the daily quota checks.
+func (s *Server) managed(ctx context.Context, i store.Instance) (managedServer, error) {
+	now := s.now()
+	devices, err := s.store.CountHandles(ctx, i.ID)
+	if err != nil {
+		return managedServer{}, err
+	}
+	today, err := s.store.SentToday(ctx, i.ID, now)
+	if err != nil {
+		return managedServer{}, err
+	}
+	days, err := s.store.UsageFor(ctx, i.ID, usageWindow)
+	if err != nil {
+		return managedServer{}, err
+	}
+	from := store.Day(now.AddDate(0, 0, 1-usageWindow))
+	var sent, limited, invalid int
+	for _, d := range days {
+		if d.Day >= from {
+			sent, limited, invalid = sent+d.Sent, limited+d.RateLimited, invalid+d.InvalidHandles
+		}
+	}
+	t := TierFor(i)
+	return managedServer{PushID: i.ID, Name: i.Name, URL: i.URL, Status: i.Status, Tier: t.Name,
+		Devices: thousands(devices), SentToday: thousands(today), PerMinute: thousands(t.PerMinute), PerDay: thousands(t.PerDay),
+		WeekSent: thousands(sent), WeekRateLimited: thousands(limited), WeekInvalid: thousands(invalid)}, nil
 }
 
 const somethingWrong = "Something went wrong. Try again later."
@@ -147,7 +181,13 @@ func (s *Server) renderList(w http.ResponseWriter, r *http.Request, email, notic
 		data.Session = session
 	}
 	for _, i := range list {
-		data.Servers = append(data.Servers, managedServer{PushID: i.ID, Name: i.Name, URL: i.URL, Status: i.Status, Tier: TierFor(i).Name})
+		row, err := s.managed(ctx, i)
+		if err != nil {
+			s.log.Error("usage lookup failed", "component", "web", "push_id", i.ID, "err", err)
+			s.render(w, http.StatusInternalServerError, "manage-list", pageData{Error: somethingWrong})
+			return
+		}
+		data.Servers = append(data.Servers, row)
 	}
 	s.render(w, http.StatusOK, "manage-list", data)
 }

@@ -56,9 +56,15 @@ func TestManageNewSecret(t *testing.T) {
 	h := newHarness(t)
 	id, oldAuth := h.register("A", "a@example.org", "")
 	dev := h.handle(id, "tok")
+	h.send(oldAuth, SendItem{Handle: dev.Handle, Ciphertext: ct})
 	list, session := h.openManage("A@example.org")
 	if !strings.Contains(list, id) {
 		t.Fatalf("server not listed: %s", list)
+	}
+	for _, want := range []string{"1 registered phone", "1 of 500 sent", "30 a minute, 500 a day (email tier)", "1 sent, 0 rate limited"} {
+		if !strings.Contains(list, want) {
+			t.Errorf("usage %q missing", want)
+		}
 	}
 	code, body := h.form("/manage/secret", h.nextIP(), url.Values{"session": {session}, "push_id": {id}})
 	secret := secretRe.FindStringSubmatch(body)

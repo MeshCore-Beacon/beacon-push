@@ -90,6 +90,7 @@ button.copy:hover { background: var(--code); }
 .server h2 { margin-top: 0; }
 .server dl { display: grid; grid-template-columns: auto 1fr; gap: .3rem 1rem; margin: 0; }
 .server dt { color: var(--muted); }
+.server .muted { color: var(--muted); font-size: .9375rem; }
 .server dd { margin: 0; overflow-wrap: anywhere; }
 .server form .check { margin-top: 1.5rem; }
 .server form .hint { margin: .5rem 0 0; }

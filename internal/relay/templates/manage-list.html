@@ -10,19 +10,24 @@
 <dl>
 <dt>Push ID</dt><dd><code>{{.PushID}}</code></dd>
 <dt>URL</dt><dd>{{if .URL}}{{.URL}}{{else}}none{{end}}</dd>
-<dt>Status</dt><dd>{{.Status}}, {{.Tier}} tier</dd>
+<dt>Status</dt><dd>{{.Status}}</dd>
+<dt>Devices</dt><dd>{{.Devices}} registered {{if eq .Devices "1"}}phone{{else}}phones{{end}}</dd>
+<dt>Today</dt><dd>{{.SentToday}} of {{.PerDay}} sent <span class="muted">(resets 00:00 UTC)</span></dd>
+<dt>Limits</dt><dd>{{.PerMinute}} a minute, {{.PerDay}} a day ({{.Tier}} tier)</dd>
+<dt>Last 7 days</dt><dd>{{.WeekSent}} sent, {{.WeekRateLimited}} rate limited, {{.WeekInvalid}} to stale devices</dd>
 </dl>
 <form method="post" action="/manage/secret">
 <input type="hidden" name="session" value="{{$.Session}}">
 <input type="hidden" name="push_id" value="{{.PushID}}">
 <button type="submit">Get a new secret</button>
-<p class="hint">The old secret stops working at once. Devices and limits stay.</p>
+<p class="hint">The old secret stops working at once. Registered phones and limits stay.</p>
 </form>
 <form method="post" action="/manage/remove">
 <input type="hidden" name="session" value="{{$.Session}}">
 <input type="hidden" name="push_id" value="{{.PushID}}">
-<label class="check"><input type="checkbox" name="confirm" required> <span>Remove {{.Name}}, its devices and its
-history for good.</span></label>
+<label class="check"><input type="checkbox" name="confirm" required> <span>Remove {{.Name}} from the push relay. Its users'
+phones stop getting its notifications, and the relay deletes its device registrations and send history. To use push
+again you register it as a new server with a new Push ID.</span></label>
 <button type="submit" class="danger">Remove server</button>
 </form>
 </section>

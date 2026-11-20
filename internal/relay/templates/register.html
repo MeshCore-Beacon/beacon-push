@@ -1,0 +1,36 @@
+{{template "head" "Register a server"}}
+<h1>Register a server</h1>
+<p class="lead">We'll email you a link to your Push ID and secret. Up to two servers per email.</p>
+{{template "error" .Error}}
+<form method="post" action="/register">
+<div class="field">
+<label for="name">Server name</label>
+<input id="name" name="name" required maxlength="40" value="{{.Form.Name}}" placeholder="Ottawa Mesh" aria-describedby="name-hint">
+<p class="hint" id="name-hint">Shown on every notification.</p>
+</div>
+
+<div class="field">
+<label for="email">Your email</label>
+<input id="email" name="email" type="email" required maxlength="254" value="{{.Form.Email}}" autocomplete="email" aria-describedby="email-hint">
+<p class="hint" id="email-hint">Only for the link and notices about this server.</p>
+</div>
+
+<div class="field">
+<label for="url">Public URL <span class="optional">(optional)</span></label>
+<input id="url" name="url" type="url" maxlength="200" value="{{.Form.URL}}" placeholder="https://beacon.example.org" aria-describedby="url-hint">
+<p class="hint" id="url-hint">Raises your limits from {{.Tiers.EmailPerMinute}} to {{.Tiers.VerifiedPerMinute}} a minute and
+{{.Tiers.EmailPerDay}} to {{.Tiers.VerifiedPerDay}} a day, once a daily check confirms the server is yours.</p>
+</div>
+
+<div class="trap" aria-hidden="true">
+<label for="website">Leave this empty</label>
+<input id="website" name="website" tabindex="-1" autocomplete="off">
+</div>
+
+<label class="check"><input type="checkbox" name="terms" required> <span>I accept the <a href="/terms">terms</a> and
+have read the <a href="/privacy">privacy notice</a>.</span></label>
+
+<button type="submit">Send link</button>
+</form>
+<p class="hint">Lost a Push secret? <a href="/manage">Manage your servers</a>.</p>
+{{template "foot"}}

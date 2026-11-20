@@ -1,0 +1,54 @@
+{{template "head" "Your servers"}}
+<h1>Your servers</h1>
+{{template "error" .Error}}
+{{if .Notice}}<p class="warning" role="status">{{.Notice}}</p>{{end}}
+{{if .Session}}
+<p class="lead">Opened for <strong>{{.Email}}</strong>. This page works for 15 minutes and one action.</p>
+{{range .Servers}}
+<section class="server" aria-labelledby="s-{{.PushID}}">
+<div class="server-head">
+<h2 id="s-{{.PushID}}">{{.Name}}</h2>
+<span class="pill pill-{{.Status}}">{{if eq .Status "active"}}Active{{else if eq .Status "suspended"}}Suspended{{else}}{{.Status}}{{end}}</span>
+</div>
+<p class="server-id"><code>{{.PushID}}</code>{{if .URL}} <span>{{.URL}}</span>{{end}}</p>
+
+<div class="today{{if .NearLimit}} near{{end}}">
+<p class="today-figure"><strong>{{.SentToday}}</strong> sent today <span>of {{.PerDay}}</span></p>
+<progress value="{{.TodayN}}" max="{{.PerDayN}}">{{.SentToday}} of {{.PerDay}}</progress>
+<p class="hint">Resets at 00:00 UTC. Up to {{.PerMinute}} a minute on the {{.Tier}} tier.</p>
+</div>
+
+<dl class="stats">
+<div><dt>Phones</dt><dd>{{.Devices}}</dd></div>
+<div><dt>Sent in 7 days</dt><dd>{{.WeekSent}}</dd></div>
+<div><dt>Rate limited</dt><dd>{{.WeekRateLimited}}</dd></div>
+<div><dt>Stale devices</dt><dd>{{.WeekInvalid}}</dd></div>
+</dl>
+
+<form method="post" action="/manage/secret" class="action">
+<input type="hidden" name="session" value="{{$.Session}}">
+<input type="hidden" name="push_id" value="{{.PushID}}">
+<button type="submit">Get a new secret</button>
+<p class="hint">The old secret stops working at once. Registered phones and limits stay.</p>
+</form>
+
+<details class="remove">
+<summary>Remove this server</summary>
+<form method="post" action="/manage/remove">
+<input type="hidden" name="session" value="{{$.Session}}">
+<input type="hidden" name="push_id" value="{{.PushID}}">
+<label class="check"><input type="checkbox" name="confirm" required> <span>Remove {{.Name}} from the push relay. Its users'
+phones stop getting its notifications, and the relay deletes its device registrations and send history. To use push
+again you register it as a new server with a new Push ID.</span></label>
+<button type="submit" class="danger">Remove server</button>
+</form>
+</details>
+</section>
+{{end}}
+{{else if not .Error}}
+<p class="lead">No servers are registered with this address any more.</p>
+<p><a class="button" href="/register">Register a server</a></p>
+{{else}}
+<p><a href="/manage">Ask for a new link</a></p>
+{{end}}
+{{template "foot"}}

@@ -1,0 +1,9 @@
+.git
+.github
+.claude
+docs/superpowers
+*.db
+*.db-*
+.env
+.env.*
+*.p8

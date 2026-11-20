@@ -19,7 +19,8 @@ write conventional commit messages, and open the PR against `dev`.
 ## What the relay does
 
 beacon-push accepts notifications from registered beacon-server instances and
-forwards them to the Beacon app through Firebase Cloud Messaging. It handles
+forwards them to the Beacon app through APNs (iOS) and Firebase Cloud
+Messaging (Android). It handles
 server registration, device handles, rate limits and abuse reports. Rule
 matching and notification content belong in
 [beacon-server](https://github.com/MeshCore-Beacon/beacon-server), not here.
@@ -32,7 +33,7 @@ Keep in mind when contributing:
 - **The relay must not read content.** Payloads are encrypted between
   beacon-server and the app. Do not add logging, parsing or storage of
   payload bodies.
-- **Credentials are secrets.** The Firebase key, SMTP password and instance
+- **Credentials are secrets.** The Firebase and APNs keys, SMTP password and instance
   secrets come from the environment, never from source, logs or responses.
   Instance secrets are stored hashed.
 - **Keep usage records minimal.** Log what abuse tracking needs (server, time,

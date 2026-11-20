@@ -1,0 +1,18 @@
+{{template "head" "Manage your servers"}}
+<h1>Manage your servers</h1>
+<p class="lead">Lost a Push secret, or need a slot back? We'll email a link to the address you registered with.</p>
+{{template "error" .Error}}
+<form method="post" action="/manage">
+<div class="field">
+<label for="email">Your email</label>
+<input id="email" name="email" type="email" required maxlength="254" value="{{.Form.Email}}" autocomplete="email">
+</div>
+
+<div class="trap" aria-hidden="true">
+<label for="website">Leave this empty</label>
+<input id="website" name="website" tabindex="-1" autocomplete="off">
+</div>
+
+<button type="submit">Send link</button>
+</form>
+{{template "foot"}}

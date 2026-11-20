@@ -17,11 +17,12 @@ Once a fix is released we will publish a security advisory on the repository.
 ## Scope
 
 beacon-push is the relay that forwards notifications from self-hosted
-beacon-server instances to the Beacon app through Firebase Cloud Messaging.
+beacon-server instances to the Beacon app, through Apple's push service (APNs)
+for iOS and Firebase Cloud Messaging for Android.
 Relevant findings include ways to send notifications without valid instance
 credentials, to reach devices registered with another server, to get around
 rate limits or registration limits, to read notification contents, leaks of
-the Firebase key, SMTP credentials or instance secrets, weaknesses in email or
+the Firebase key, the APNs key, SMTP credentials or instance secrets, weaknesses in email or
 domain verification, dependency vulnerabilities, and issues in the container
 image or build pipeline. Vulnerabilities in rule matching or payload
 encryption on the server side belong in the

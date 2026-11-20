@@ -1,0 +1,18 @@
+{{template "head" "Privacy"}}
+<h1>Privacy notice</h1>
+<h2>Server operators</h2>
+<p>When you register a server we keep its name, your email address, the public URL if you gave one, the address you
+registered from, and when you accepted the terms. Your Push secret is stored only as a one-way hash. We use your
+email to confirm the registration and to contact you about the server. We do not share it.</p>
+<h2>App users</h2>
+<p>When the Beacon app turns on notifications for a server, it gives the relay its push token (Apple's on iPhone, Google
+Firebase's on Android) and gets back a handle that only that server can use. The server never sees the push token.</p>
+<p>For each notification the relay keeps the sending server, the time, the device handle, the size and a fingerprint
+(hash) of the encrypted content, for 30 days. It cannot read the content: that is encrypted between the server and
+the app. Daily totals per server are kept for about a year.</p>
+<p>Notifications to iPhones go through Apple's push service, to Android phones through Google Firebase Cloud
+Messaging.</p>
+<h2>Deleting data</h2>
+<p>Removing a server or signing out in the app deletes its handle. Removed handles are erased after 30 days. To have
+a registered server deleted, email <a href="mailto:abuse@meshcorebeacon.ca">abuse@meshcorebeacon.ca</a>.</p>
+{{template "foot"}}
